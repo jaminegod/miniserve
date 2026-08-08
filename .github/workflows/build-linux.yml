@@ -1,5 +1,6 @@
 # Build Linux release (Ubuntu / generic Linux)
-# Saves only final binaries (not the whole target dir) and applies size optimizations.
+# Cleans possible conflicting RUSTFLAGS (embed-bitcode), uses size-friendly RUSTFLAGS (no -C lto),
+# copies only final binaries to artifact dirs and strips them before upload.
 name: Build Linux release
 
 on:
@@ -21,6 +22,13 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Show environment (debug)
+        run: |
+          echo "Runner: $RUNNER_OS"
+          echo "Initial RUSTFLAGS: <$RUSTFLAGS>"
+          rustc --version || true
+          cargo --version || true
+
       - name: Cache cargo registry, git and target
         uses: actions/cache@v4
         with:
@@ -39,16 +47,14 @@ jobs:
           profile: minimal
           components: clippy
 
-      - name: Show rust & cargo versions
+      - name: Build (release) with safe size optimizations
         run: |
-          rustc --version
-          cargo --version
-
-      - name: Build (release) with size optimizations
-        env:
-          # Temporary per-run optimizations (don't require changing Cargo.toml)
-          RUSTFLAGS: -C lto=yes -C opt-level=z -C codegen-units=1
-        run: cargo build --release --locked
+          # Remove any embedded-bitcode flag that may be present in RUSTFLAGS
+          export RUSTFLAGS="${RUSTFLAGS//-C embed-bitcode=no/}"
+          # Add size-friendly flags but avoid -C lto to prevent conflicts with embed-bitcode
+          export RUSTFLAGS="$RUSTFLAGS -C opt-level=z -C codegen-units=1"
+          echo "Effective RUSTFLAGS: <$RUSTFLAGS>"
+          cargo build --release --locked
 
       - name: Copy final executables to artifact dir and strip
         run: |
@@ -56,11 +62,18 @@ jobs:
           mkdir -p release_artifacts
           echo "Finding top-level executables in target/release (no deps/ subdirs)..."
           # Copy only top-level executable files (avoid copying deps, *.rlib, debug files)
-          find target/release -maxdepth 1 -type f -executable -print0 | while IFS= read -r -d '' bin; do
-            echo "Copying $bin"
-            cp "$bin" release_artifacts/ || true
+          find target/release -maxdepth 1 -type f -print0 | while IFS= read -r -d '' bin; do
+            # Heuristic: treat files with no extension or named like the crate as executables
+            bn=$(basename "$bin")
+            if [ -x "$bin" ] || [[ "$bn" != *.* ]]; then
+              echo "Copying $bin"
+              cp "$bin" release_artifacts/ || true
+            fi
           done
-          # On some runners binaries are not marked executable; also copy by common names (optional)
+          # As a fallback, also copy any file in target/release matching the crate name (miniserve)
+          if [ -f target/release/miniserve ] && [ ! -f release_artifacts/miniserve ]; then
+            cp target/release/miniserve release_artifacts/ || true
+          fi
           # Strip the copied binaries to reduce size
           for f in release_artifacts/* ; do
             if [ -f "$f" ]; then
@@ -83,10 +96,17 @@ jobs:
   build-static-musl:
     name: Build static (musl) for x86_64 (optional)
     runs-on: ubuntu-latest
-    # If you don't need musl static builds you can remove this job.
+    # Remove this job if you don't need musl static builds.
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Show environment (musl debug)
+        run: |
+          echo "Runner: $RUNNER_OS"
+          echo "Initial RUSTFLAGS: <$RUSTFLAGS>"
+          rustc --version || true
+          cargo --version || true
 
       - name: Install build deps (musl)
         run: |
@@ -113,29 +133,33 @@ jobs:
       - name: Add musl target
         run: rustup target add x86_64-unknown-linux-musl
 
-      - name: Build static binary (musl) with optimizations
-        env:
-          RUSTFLAGS: -C lto=yes -C opt-level=z -C codegen-units=1
-          CC: musl-gcc
-        run: cargo build --release --target x86_64-unknown-linux-musl --locked
+      - name: Build static binary (musl) with safe optimizations
+        run: |
+          # Clean embed-bitcode if present
+          export RUSTFLAGS="${RUSTFLAGS//-C embed-bitcode=no/}"
+          export RUSTFLAGS="$RUSTFLAGS -C opt-level=z -C codegen-units=1"
+          echo "Effective RUSTFLAGS: <$RUSTFLAGS>"
+          export CC=musl-gcc
+          cargo build --release --target x86_64-unknown-linux-musl --locked
 
       - name: Copy musl binary(s) to artifact dir and strip
         run: |
           set -e
           mkdir -p release_artifacts_musl
-          echo "Finding top-level executables in target/x86_64-unknown-linux-musl/release..."
-          find target/x86_64-unknown-linux-musl/release -maxdepth 1 -type f -executable -print0 | while IFS= read -r -d '' bin; do
-            echo "Copying $bin"
-            cp "$bin" release_artifacts_musl/ || true
-          done
-          # Some musl builds might not mark as executable; include regular files with no extension
-          find target/x86_64-unknown-linux-musl/release -maxdepth 1 -type f ! -name '*.d' -print0 | while IFS= read -r -d '' bin; do
+          echo "Finding top-level files in target/x86_64-unknown-linux-musl/release..."
+          # Copy likely final artifacts
+          find target/x86_64-unknown-linux-musl/release -maxdepth 1 -type f -print0 | while IFS= read -r -d '' bin; do
             bn=$(basename "$bin")
-            # copy if not already copied
-            if [ ! -f "release_artifacts_musl/$bn" ]; then
+            # copy executable-like or no-extension files
+            if [ -x "$bin" ] || [[ "$bn" != *.* ]]; then
+              echo "Copying $bin"
               cp "$bin" release_artifacts_musl/ || true
             fi
           done
+          # Fallback copy by crate name
+          if [ -f target/x86_64-unknown-linux-musl/release/miniserve ] && [ ! -f release_artifacts_musl/miniserve ]; then
+            cp target/x86_64-unknown-linux-musl/release/miniserve release_artifacts_musl/ || true
+          fi
           for f in release_artifacts_musl/* ; do
             if [ -f "$f" ]; then
               echo "File: $f"
