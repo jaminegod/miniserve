@@ -1,0 +1,1893 @@
+use std::{borrow::Cow, time::SystemTime};
+
+use actix_web::http::{StatusCode, Uri};
+use chrono::{DateTime, Local};
+use chrono_humanize::Humanize;
+use clap::{ValueEnum, crate_name, crate_version};
+use fast_qr::{
+    QRBuilder,
+    convert::{Builder, svg::SvgBuilder},
+    qr::QRCodeError,
+};
+use maud::{DOCTYPE, Markup, PreEscaped, html};
+use percent_encoding::utf8_percent_encode;
+use strum::{Display, IntoEnumIterator};
+
+use crate::auth::CurrentUser;
+use crate::consts;
+use crate::listing::{
+    Breadcrumb, Entry, ListingQueryParameters, SortingMethod, SortingOrder, ViewMode,
+    percent_encode_sets::COMPONENT,
+};
+use crate::{MiniserveConfig, archive::ArchiveMethod};
+
+#[allow(clippy::too_many_arguments)]
+/// Renders the file listing
+pub fn page(
+    entries: Vec<Entry>,
+    readme: Option<(String, String)>,
+    abs_uri: &Uri,
+    is_root: bool,
+    query_params: ListingQueryParameters,
+    breadcrumbs: &[Breadcrumb],
+    encoded_dir: &str,
+    conf: &MiniserveConfig,
+    current_user: Option<&CurrentUser>,
+) -> Markup {
+    let (sort_method, sort_order, search, view) = (
+        query_params.sort,
+        query_params.order,
+        query_params.search.as_deref(),
+        query_params.view.unwrap_or(conf.default_view),
+    );
+
+    // If query_params.raw is true, we want render a minimal directory listing
+    if query_params.raw.is_some() && query_params.raw.unwrap() {
+        return raw(entries, search, is_root, conf);
+    }
+
+    let upload_route = format!("{}/upload", conf.route_prefix);
+    let rm_route = format!("{}/rm", conf.route_prefix);
+
+    let upload_action = build_upload_action(&upload_route, encoded_dir, sort_method, sort_order);
+    let mkdir_action = build_mkdir_action(&upload_route, encoded_dir);
+
+    let title_path = breadcrumbs_to_path_string(breadcrumbs);
+
+    let upload_allowed = conf.allowed_upload_dir.is_empty()
+        || conf
+            .allowed_upload_dir
+            .iter()
+            .any(|x| encoded_dir.starts_with(&format!("/{x}")));
+    let rm_allowed = conf.allowed_rm_dir.is_empty()
+        || conf
+            .allowed_rm_dir
+            .iter()
+            .any(|x| encoded_dir.starts_with(&format!("/{x}")));
+
+    // OR with other conditions in the future if more actions are added
+    let show_actions = conf.rm_enabled && rm_allowed;
+    let actions_conf = show_actions.then(|| ActionsConf {
+        rm_route: &rm_route,
+    });
+
+    html! {
+        (DOCTYPE)
+        html {
+            (page_header(&title_path, conf.file_upload, conf.web_upload_concurrency, &conf.api_route, &conf.favicon_route, &conf.css_route))
+
+            body #drop-container data-route-prefix=(conf.route_prefix) data-encoded-dir=(encoded_dir)
+            {
+                div.toolbar_box_group {
+                    @if conf.file_upload {
+                        div.drag-form {
+                            div.form_title {
+                                h1 { "Drop your file here to upload it" }
+                            }
+                        }
+                    }
+
+                    @if conf.mkdir_enabled {
+                        div.form {
+                            div.form_title {
+                                h1 { "Create a new directory" }
+                            }
+                        }
+                    }
+                }
+                nav {
+                    (qr_spoiler(conf.show_qrcode, abs_uri))
+                }
+                div.container {
+                    span #top { }
+                    div.title-search-box {
+                        h1.title dir="ltr" {
+                            @for el in breadcrumbs {
+                                @if el.link == "." {
+                                    // wrapped in span so the text doesn't shift slightly when it turns into a link
+                                    span { bdi { (el.name) } }
+                                } @else {
+                                    a href=(parametrized_link(&el.link, sort_method, sort_order, false, search, Some(view))) {
+                                        bdi { (el.name) }
+                                    }
+                                }
+                                "/"
+                            }
+                        }
+                        div.search-box {
+                            form id="search" method="GET" {
+                                input type="text" name="search" value=(search.unwrap_or_default()) placeholder="Search..." {}
+                                button type="submit" { "Search" }
+                            }
+                            (view_switcher(view, sort_method, sort_order, search))
+                            (color_scheme_selector(conf.hide_theme_selector))
+                        }
+                    }
+                    div.toolbar {
+                        @if conf.tar_enabled || conf.tar_gz_enabled || conf.zip_enabled {
+                            div.tool_row.download_tools {
+                                div.tool data-tool="download" {
+                                    @for archive_method in ArchiveMethod::iter() {
+                                        @if archive_method.is_enabled(conf.tar_enabled, conf.tar_gz_enabled, conf.zip_enabled) {
+                                            (archive_button(archive_method, sort_method, sort_order))
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        div.tool_row.upload_tools {
+                            @if conf.file_upload && upload_allowed {
+                                form.tool id="file_submit" data-tool="upload" action=(upload_action) method="POST" enctype="multipart/form-data" {
+                                    p { "Select a file to upload or drag it anywhere into the window" }
+                                    div {
+                                        @match &conf.uploadable_media_type {
+                                            Some(accept) => {input #file-input accept=(accept) type="file" name="file_to_upload" required="" multiple {}},
+                                            None => {input #file-input type="file" name="file_to_upload" required="" multiple {}}
+                                        }
+                                        button type="submit" title="Upload File" { "Upload file" }
+                                    }
+                                }
+                            }
+                            @if conf.mkdir_enabled && upload_allowed {
+                                form.tool id="mkdir" data-tool="mkdir" action=(mkdir_action) method="POST" enctype="multipart/form-data" {
+                                    p { "Specify a directory name to create" }
+                                    div {
+                                        input type="text" name="mkdir" required="" placeholder="Directory name" {}
+                                        button type="submit" title="Create directory" { "Create directory" }
+                                    }
+                                }
+                            }
+                            @if conf.pastebin_enabled && upload_allowed {
+                                form.tool id="pastebin" data-tool="pastebin" {
+                                    p { "Create a text file in the current directory, a random filename will be generated, or you may specify one." }
+                                    div {
+                                        textarea #pastebin_content name="paste_content" title="Text content" required="" { }
+                                    }
+                                    div {
+                                        input type="text" name="paste_filename" title="Filename" placeholder="Filename (Optional)" autocomplete="off" {}
+                                        button type="submit" title="Create file" { "Create file" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    div.workspace {
+                        aside.tree-sidebar {
+                            div.tree-header { "Directories" }
+                            ul.tree id="dir-tree" {
+                                li.tree-node.root data-path="" data-loaded="false" {
+                                    span.tree-toggle.collapsed title="Expand/collapse" { "▸" }
+                                    a.tree-link href=(parametrized_link(".", sort_method, sort_order, false, search, Some(view))) {
+                                        (title_path.split('/').next().unwrap_or("root").to_string())
+                                    }
+                                    ul.tree-children hidden { }
+                                }
+                            }
+                        }
+                        div.content-area {
+                            @match view {
+                                ViewMode::List => {
+                                    table {
+                                        thead {
+                                            th.name { (sortable_title("name", "Name", sort_method, sort_order, search)) }
+                                            th.size { (sortable_title("size", "Size", sort_method, sort_order, search)) }
+                                            th.date { (sortable_title("date", "Last modification", sort_method, sort_order, search)) }
+                                            @if show_actions {
+                                                th.actions { span { "Actions" } }
+                                            }
+                                        }
+                                        tbody {
+                                            @if !is_root {
+                                                tr {
+                                                    td colspan=(3 + show_actions as usize) {
+                                                        p {
+                                                            span.root-chevron { (chevron_left()) }
+                                                            a.root href=(parametrized_link("../", sort_method, sort_order, false, search, Some(view))) {
+                                                                "Parent directory"
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            @for entry in entries {
+                                                (entry_row(entry, sort_method, sort_order, false, search, conf.show_exact_bytes, actions_conf, &conf.route_prefix, Some(view)))
+                                            }
+                                        }
+                                    }
+                                }
+                                ViewMode::Grid => {
+                                    div.grid-view {
+                                        @if !is_root {
+                                            a.grid-card.parent-card href=(parametrized_link("../", sort_method, sort_order, false, search, Some(view))) {
+                                                div.grid-thumb { "📁" }
+                                                div.grid-name { "Parent directory" }
+                                            }
+                                        }
+                                        @for entry in entries {
+                                            (entry_card(entry, sort_method, sort_order, search, conf.show_exact_bytes, actions_conf, &conf.route_prefix, view))
+                                        }
+                                    }
+                                }
+                                ViewMode::Album => {
+                                    div.album-view {
+                                        @if !is_root {
+                                            a.album-tile.parent-tile href=(parametrized_link("../", sort_method, sort_order, false, search, Some(view))) {
+                                                div.album-bg { "📁" }
+                                                div.album-name { "Parent directory" }
+                                            }
+                                        }
+                                        @for entry in entries {
+                                            (entry_tile(entry, sort_method, sort_order, search, conf.show_exact_bytes, actions_conf, &conf.route_prefix, view))
+                                        }
+                                    }
+                                }
+                            }
+                            @if let Some(readme) = readme {
+                                div id="readme" {
+                                    h3 id="readme-filename" { (readme.0) }
+                                    div id="readme-contents" {
+                                        (PreEscaped (readme.1))
+                                    };
+                                }
+                            }
+                            a.back href="#top" {
+                                (arrow_up())
+                            }
+                            div.footer {
+                                @if conf.show_wget_footer {
+                                    (wget_footer(abs_uri, conf.title.as_deref(), current_user.map(|x| &*x.name),
+                                        conf.file_external_url.as_deref()))
+                                }
+                                @if !conf.hide_version_footer {
+                                    (version_footer())
+                                }
+                            }
+                        }
+                    }
+                    // Lightbox modal for image preview
+                    div.lightbox-modal.hidden #lightbox {
+                        button.lightbox-close title="Close (Esc)" { "✕" }
+                        button.lightbox-prev title="Previous" { "‹" }
+                        button.lightbox-next title="Next" { "›" }
+                        img.lightbox-image #lightbox-image alt="Preview" {}
+                        div.lightbox-caption #lightbox-caption {}
+                    }
+                }
+                div.upload_area id="upload_area" {
+                    template id="upload_file_item" {
+                        li.upload_file_item {
+                            div.upload_file_container {
+                                div.upload_file_text {
+                                    span.file_upload_percent { "" }
+                                    {" - "}
+                                    span.file_size { "" }
+                                    {" - "}
+                                    span.file_name { "" }
+                                }
+                                button.file_cancel_upload { "✖" }
+                            }
+                            div.file_progress_bar {}
+                        }
+                    }
+                    div.upload_container {
+                        div.upload_header {
+                            h4 style="margin:0px" id="upload_title" {}
+                            svg id="upload-toggle" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="size-6" {
+                              path stroke-linecap="round" stroke-linejoin="round" d="m4.5 15.75 7.5-7.5 7.5 7.5" {}
+                            }
+                        }
+                        div.upload_action {
+                            p id="upload_action_text" { "Starting upload..." }
+                            button.upload_cancel id="upload_cancel" { "CANCEL" }
+                        }
+                        div.upload_files {
+                            ul.upload_file_list id="upload_file_list" {
+
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Renders the file listing
+pub fn raw(
+    entries: Vec<Entry>,
+    search: Option<&str>,
+    is_root: bool,
+    conf: &MiniserveConfig,
+) -> Markup {
+    html! {
+        (DOCTYPE)
+        html {
+            body {
+                table {
+                    thead {
+                        th.name { "Name" }
+                        th.size { "Size" }
+                        th.date { "Last modification" }
+                    }
+                    tbody {
+                        @if !is_root {
+                            tr {
+                                td colspan="3" {
+                                    p {
+                                        a.root href=(parametrized_link("../", None, None, true, search, None)) {
+                                            ".."
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        @for entry in entries {
+                            (entry_row(entry, None, None, true, search, conf.show_exact_bytes, None, &conf.route_prefix, None))
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Renders the QR code SVG
+fn qr_code_svg(url: &Uri, margin: usize) -> Result<String, QRCodeError> {
+    let qr = QRBuilder::new(url.to_string())
+        .ecl(consts::QR_EC_LEVEL)
+        .build()?;
+    let svg = SvgBuilder::default().margin(margin).to_str(&qr);
+
+    Ok(svg)
+}
+
+/// Build a path string from a list of breadcrumbs.
+fn breadcrumbs_to_path_string(breadcrumbs: &[Breadcrumb]) -> String {
+    breadcrumbs
+        .iter()
+        .map(|el| el.name.clone())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+// Partial: version footer
+fn version_footer() -> Markup {
+    html! {
+       div.version {
+            a href="https://github.com/svenstaro/miniserve" {
+               (crate_name!())
+           }
+           (format!("/{}", crate_version!()))
+       }
+    }
+}
+
+fn wget_footer(
+    abs_path: &Uri,
+    root_dir_name: Option<&str>,
+    current_user: Option<&str>,
+    file_external_url: Option<&str>,
+) -> Markup {
+    fn escape_apostrophes(x: &str) -> String {
+        x.replace('\'', "'\"'\"'")
+    }
+
+    // Directory depth, 0 is root directory
+    let cut_dirs = match abs_path.path().matches('/').count() - 1 {
+        // Put all the files in a folder of this name
+        0 => format!(
+            " -P '{}'",
+            escape_apostrophes(
+                root_dir_name.unwrap_or_else(|| abs_path.authority().unwrap().as_str())
+            )
+        ),
+        1 => String::new(),
+        // Avoids putting the files in excessive directories
+        x => format!(" --cut-dirs={}", x - 1),
+    };
+
+    // Ask for password if authentication is required
+    let user_params = match current_user {
+        Some(user) => format!(" --ask-password --user '{}'", escape_apostrophes(user)),
+        None => String::new(),
+    };
+
+    // Add the -H option to span hosts when serving files from another instance
+    let span_hosts_option = if file_external_url.is_some() {
+        " -H"
+    } else {
+        " -nH"
+    };
+
+    let encoded_abs_path = abs_path.to_string().replace('\'', "%27");
+    let command = format!(
+        "wget -rcnp -R 'index.html*'{span_hosts_option}{cut_dirs}{user_params} '{encoded_abs_path}?raw=true'"
+    );
+    let click_to_copy = format!("navigator.clipboard.writeText(\"{command}\")");
+
+    html! {
+        div.downloadDirectory {
+            p { "Download folder:" }
+            a.cmd title="Click to copy!" style="cursor: pointer;" onclick=(click_to_copy) { (command) }
+        }
+    }
+}
+
+/// Build the action of the upload form
+fn build_upload_action(
+    upload_route: &str,
+    encoded_dir: &str,
+    sort_method: Option<SortingMethod>,
+    sort_order: Option<SortingOrder>,
+) -> String {
+    let mut upload_action = format!("{upload_route}?path={encoded_dir}");
+    if let Some(sorting_method) = sort_method {
+        upload_action = format!("{}&sort={}", upload_action, sorting_method);
+    }
+    if let Some(sorting_order) = sort_order {
+        upload_action = format!("{}&order={}", upload_action, sorting_order);
+    }
+
+    upload_action
+}
+
+/// Build the action of the mkdir form
+fn build_mkdir_action(mkdir_route: &str, encoded_dir: &str) -> String {
+    format!("{mkdir_route}?path={encoded_dir}")
+}
+
+const THEME_PICKER_CHOICES: &[(&str, &str)] = &[
+    ("Default (light/dark)", "default"),
+    ("Squirrel (light)", "squirrel"),
+    ("Arch Linux (dark)", "archlinux"),
+    ("Ayu Dark (dark)", "ayu_dark"),
+    ("Zenburn (dark)", "zenburn"),
+    ("Monokai (dark)", "monokai"),
+];
+
+#[derive(Debug, Clone, ValueEnum, Display)]
+pub enum ThemeSlug {
+    #[strum(serialize = "squirrel")]
+    Squirrel,
+    #[strum(serialize = "archlinux")]
+    Archlinux,
+    #[strum(serialize = "ayu_dark")]
+    AyuDark,
+    #[strum(serialize = "zenburn")]
+    Zenburn,
+    #[strum(serialize = "monokai")]
+    Monokai,
+}
+
+impl ThemeSlug {
+    pub fn css(&self) -> &str {
+        match self {
+            Self::Squirrel => grass::include!("data/themes/squirrel.scss"),
+            Self::Archlinux => grass::include!("data/themes/archlinux.scss"),
+            Self::AyuDark => grass::include!("data/themes/ayu_dark.scss"),
+            Self::Zenburn => grass::include!("data/themes/zenburn.scss"),
+            Self::Monokai => grass::include!("data/themes/monokai.scss"),
+        }
+    }
+
+    pub fn css_dark(&self) -> String {
+        format!("@media (prefers-color-scheme: dark) {{\n{}}}", self.css())
+    }
+}
+
+/// Build a query string for view switching links, preserving sort/order/search.
+fn view_switch_link(
+    target: ViewMode,
+    sort_method: Option<SortingMethod>,
+    sort_order: Option<SortingOrder>,
+    search: Option<&str>,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if target != ViewMode::List {
+        parts.push(format!("view={target}"));
+    }
+    if let (Some(m), Some(o)) = (sort_method, sort_order) {
+        parts.push(format!("sort={m}"));
+        parts.push(format!("order={o}"));
+    }
+    if let Some(s) = search
+        && !s.is_empty()
+    {
+        parts.push(format!("search={}", utf8_percent_encode(s, COMPONENT)));
+    }
+    if parts.is_empty() {
+        "?".to_string()
+    } else {
+        format!("?{}", parts.join("&"))
+    }
+}
+
+/// Partial: view mode switcher (list / grid / album)
+fn view_switcher(
+    current: ViewMode,
+    sort_method: Option<SortingMethod>,
+    sort_order: Option<SortingOrder>,
+    search: Option<&str>,
+) -> Markup {
+    let modes = [
+        (ViewMode::List, "list", "☰", "List view"),
+        (ViewMode::Grid, "grid", "▦", "Grid / thumbnail view"),
+        (ViewMode::Album, "album", "≹", "Album / tiled view"),
+    ];
+    html! {
+        div.view-switcher {
+            @for (mode, slug, icon, title) in modes {
+                @if mode == current {
+                    a.view-btn.active data-view=(slug) title=(title) { (icon) }
+                } @else {
+                    a.view-btn href=(view_switch_link(mode, sort_method, sort_order, search))
+                        data-view=(slug) title=(title) { (icon) }
+                }
+            }
+        }
+    }
+}
+
+/// Partial: grid card for an entry
+#[allow(clippy::too_many_arguments)]
+fn entry_card(
+    entry: Entry,
+    sort_method: Option<SortingMethod>,
+    sort_order: Option<SortingOrder>,
+    search: Option<&str>,
+    show_exact_bytes: bool,
+    actions_conf: Option<ActionsConf>,
+    route_prefix: &str,
+    view: ViewMode,
+) -> Markup {
+    let link = parametrized_link(
+        &entry.link,
+        sort_method,
+        sort_order,
+        false,
+        search,
+        Some(view),
+    );
+    let is_dir = entry.is_dir();
+    html! {
+        div.grid-card.(if is_dir { "dir-card" } else { "file-card" }) {
+            @if is_dir {
+                a.grid-thumb href=(link) {
+                    span.grid-icon { "📁" }
+                }
+                a.grid-name href=(link) {
+                    (entry.name) "/"
+                }
+            } @else if entry.is_image {
+                a.grid-thumb.image-thumb href=(&entry.link) data-lightbox="1" {
+                    img loading="lazy" src=(&entry.link) alt=(&entry.name) {}
+                }
+                div.grid-info {
+                    a.grid-name href=(&entry.link) { (entry.name) }
+                    @if let Some(size) = entry.size {
+                        span.grid-meta {
+                            (if show_exact_bytes {
+                                format!("{} B", size.as_u64())
+                            } else {
+                                format!("{size}")
+                            })
+                        }
+                    }
+                }
+            } @else {
+                a.grid-thumb href=(&entry.link) {
+                    span.grid-icon { "📃" }
+                }
+                div.grid-info {
+                    a.grid-name href=(&entry.link) { (entry.name) }
+                    @if let Some(size) = entry.size {
+                        span.grid-meta {
+                            (if show_exact_bytes {
+                                format!("{} B", size.as_u64())
+                            } else {
+                                format!("{size}")
+                            })
+                        }
+                    }
+                }
+            }
+            @if let Some(conf) = actions_conf {
+                div.grid-actions {
+                    (rm_form(conf.rm_route, &entry.link, route_prefix))
+                }
+            }
+        }
+    }
+}
+
+/// Partial: album tile for an entry (images fill the tile; others fall back to icon tiles)
+#[allow(clippy::too_many_arguments)]
+fn entry_tile(
+    entry: Entry,
+    sort_method: Option<SortingMethod>,
+    sort_order: Option<SortingOrder>,
+    search: Option<&str>,
+    show_exact_bytes: bool,
+    actions_conf: Option<ActionsConf>,
+    route_prefix: &str,
+    view: ViewMode,
+) -> Markup {
+    let link = parametrized_link(
+        &entry.link,
+        sort_method,
+        sort_order,
+        false,
+        search,
+        Some(view),
+    );
+    let is_dir = entry.is_dir();
+    html! {
+        div.album-tile.(if is_dir { "dir-tile" } else { "file-tile" }) {
+            @if is_dir {
+                a.album-bg.icon-bg href=(link) {
+                    span { "📁" }
+                }
+                a.album-name href=(link) { (entry.name) "/" }
+            } @else if entry.is_image {
+                a.album-bg.image-bg href=(&entry.link) data-lightbox="1"
+                    style=(format!("background-image: url('{}');", &entry.link)) {
+                    img.album-preload loading="lazy" src=(&entry.link) alt=(&entry.name) {}
+                }
+                a.album-name href=(&entry.link) {
+                    (entry.name)
+                    @if let Some(size) = entry.size {
+                        " "
+                        span {
+                            (if show_exact_bytes {
+                                format!("{} B", size.as_u64())
+                            } else {
+                                format!("{size}")
+                            })
+                        }
+                    }
+                }
+            } @else {
+                a.album-bg.icon-bg href=(&entry.link) {
+                    span { "📃" }
+                }
+                a.album-name href=(&entry.link) { (entry.name) }
+            }
+            @if let Some(conf) = actions_conf {
+                div.album-actions {
+                    (rm_form(conf.rm_route, &entry.link, route_prefix))
+                }
+            }
+        }
+    }
+}
+
+/// Partial: qr code spoiler
+fn qr_spoiler(show_qrcode: bool, content: &Uri) -> Markup {
+    html! {
+        @if show_qrcode {
+            div {
+                p {
+                    "QR code"
+                }
+                div.qrcode #qrcode title=(PreEscaped(content.to_string())) {
+                    @match qr_code_svg(content, consts::SVG_QR_MARGIN) {
+                        Ok(svg) => (PreEscaped(svg)),
+                        Err(err) => (format!("QR generation error: {err:?}")),
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Partial: color scheme selector
+fn color_scheme_selector(hide_theme_selector: bool) -> Markup {
+    html! {
+        @if !hide_theme_selector {
+            div.theme-picker {
+                p {
+                    "Change theme..."
+                }
+                ul.theme {
+                    @for color_scheme in THEME_PICKER_CHOICES {
+                        li data-theme=(color_scheme.1) {
+                            (color_scheme_link(color_scheme))
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// /// Partial: color scheme link
+fn color_scheme_link(color_scheme: &(&str, &str)) -> Markup {
+    let title = format!("Switch to {} theme", color_scheme.0);
+
+    html! {
+        a href=(format!("javascript:updateColorScheme(\"{}\")", color_scheme.1)) title=(title) {
+            (color_scheme.0)
+        }
+    }
+}
+
+/// Partial: archive button
+fn archive_button(
+    archive_method: ArchiveMethod,
+    sort_method: Option<SortingMethod>,
+    sort_order: Option<SortingOrder>,
+) -> Markup {
+    let link = if sort_method.is_none() && sort_order.is_none() {
+        format!("?download={archive_method}")
+    } else {
+        format!(
+            "{}&download={}",
+            parametrized_link("", sort_method, sort_order, false, None, None),
+            archive_method
+        )
+    };
+
+    let text = format!("Download .{}", archive_method.extension());
+
+    html! {
+        a href=(link) {
+            (text)
+        }
+    }
+}
+
+/// Ensure that there's always a trailing slash behind the `link`.
+fn make_link_with_trailing_slash(link: &str) -> String {
+    if link.is_empty() || link.ends_with('/') {
+        link.to_string()
+    } else {
+        format!("{link}/")
+    }
+}
+
+/// If they are set, adds query parameters to links to keep them across pages
+fn parametrized_link(
+    link: &str,
+    sort_method: Option<SortingMethod>,
+    sort_order: Option<SortingOrder>,
+    raw: bool,
+    search: Option<&str>,
+    view: Option<ViewMode>,
+) -> String {
+    let mut query: Vec<Cow<'static, str>> = Vec::new();
+
+    if raw {
+        query.push("raw=true".into());
+    } else if let Some(method) = sort_method
+        && let Some(order) = sort_order
+    {
+        query.push(format!("sort={method}").into());
+        query.push(format!("order={order}").into());
+    }
+
+    if let Some(search) = search
+        && !search.is_empty()
+    {
+        query.push(format!("search={}", utf8_percent_encode(search, COMPONENT)).into());
+    }
+
+    // Keep the view mode across navigations (skip the default list view to keep URLs clean)
+    if let Some(view) = view
+        && view != ViewMode::List
+    {
+        query.push(format!("view={view}").into());
+    }
+
+    if query.is_empty() {
+        make_link_with_trailing_slash(link)
+    } else {
+        format!(
+            "{}?{}",
+            make_link_with_trailing_slash(link),
+            query.join("&")
+        )
+    }
+}
+
+/// Partial: table header link
+fn sortable_title(
+    name: &str,
+    title: &str,
+    sort_method: Option<SortingMethod>,
+    sort_order: Option<SortingOrder>,
+    search: Option<&str>,
+) -> Markup {
+    let mut query_items = Vec::new();
+    let mut help = format!("Sort by {name} in ascending order");
+    let mut chevron = chevron_down();
+    let mut class = "";
+
+    let order = if let Some(method) = sort_method
+        && method.to_string() == name
+    {
+        class = "active";
+        if let Some(order) = sort_order
+            && order.to_string() == "asc"
+        {
+            help = format!("Sort by {name} in descending order");
+            chevron = chevron_up();
+            "desc"
+        } else {
+            "asc"
+        }
+    } else {
+        "asc"
+    };
+
+    query_items.push(format!("sort={name}&order={order}"));
+
+    if let Some(search) = search
+        && !search.is_empty()
+    {
+        query_items.push(format!("search={}", utf8_percent_encode(search, COMPONENT)));
+    }
+
+    let link = format!("?{}", query_items.join("&"));
+
+    html! {
+        span class=(class) {
+            span.chevron { (chevron) }
+            a href=(link) title=(help) { (title) }
+        }
+    }
+}
+
+/// Partial: rm form
+fn rm_form(rm_route: &str, encoded_path: &str, prefix: &str) -> Markup {
+    let stripped_path = encoded_path.strip_prefix(prefix).unwrap_or(encoded_path);
+    let rm_action = format!("{rm_route}?path={stripped_path}");
+
+    html! {
+        form class="rm_form" action=(rm_action) method="POST" {
+            button type="submit" title="Delete" { "✗" }
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+struct ActionsConf<'a> {
+    /// Route prefix for file removal POST requests.
+    rm_route: &'a str,
+}
+
+/// Partial: row for an entry
+#[allow(clippy::too_many_arguments)]
+fn entry_row(
+    entry: Entry,
+    sort_method: Option<SortingMethod>,
+    sort_order: Option<SortingOrder>,
+    raw: bool,
+    search: Option<&str>,
+    show_exact_bytes: bool,
+    actions_conf: Option<ActionsConf>,
+    route_prefix: &str,
+    view: Option<ViewMode>,
+) -> Markup {
+    html! {
+        @let entry_type = entry.entry_type.clone();
+        tr .{ "entry-type-" (entry_type) } {
+            td {
+                p {
+                    @if entry.is_dir() {
+                        @if let Some(ref symlink_dest) = entry.symlink_info {
+                            a.symlink href=(parametrized_link(&entry.link, sort_method, sort_order, raw, search, view)) {
+                                (entry.name) "/"
+                                span.symlink-symbol { }
+                                a.directory {(symlink_dest) "/"}
+                            }
+                        }@else {
+                            a.directory href=(parametrized_link(&entry.link, sort_method, sort_order, raw, search, view)) {
+                                (entry.name) "/"
+                            }
+                        }
+                    } @else if entry.is_file() {
+                        @if let Some(ref symlink_dest) = entry.symlink_info {
+                            a.symlink href=(&entry.link) {
+                                (entry.name)
+                                span.symlink-symbol { }
+                                a.file {(symlink_dest)}
+                            }
+                        }@else {
+                            a.file href=(&entry.link) {
+                                (entry.name)
+                            }
+                        }
+
+                        @if !raw {
+                            @if let Some(size) = entry.size {
+                                @if show_exact_bytes {
+                                    span.mobile-info.size {
+                                        (maud::display(format!("{} B", size.as_u64())))
+                                    }
+                                }@else {
+                                    span.mobile-info.size {
+                                        (sortable_title("size", &format!("{size}"), sort_method, sort_order, search))
+                                    }
+                                }
+                            }
+                            @if let Some(modification_timer) = humanize_systemtime(entry.last_modification_date) {
+                                span.mobile-info.history {
+                                    (sortable_title("date", &modification_timer, sort_method, sort_order, search))
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            td.size-cell {
+                @if let Some(size) = entry.size {
+                    @if show_exact_bytes {
+                        (maud::display(format!("{} B", size.as_u64())))
+                    }@else {
+                        (maud::display(size))
+                    }
+                }
+            }
+            td.date-cell {
+                @if let Some(modification_date) = convert_to_local(entry.last_modification_date) {
+                    span {
+                        (modification_date) " "
+                    }
+                }
+                @if let Some(modification_timer) = humanize_systemtime(entry.last_modification_date) {
+                    span.history {
+                        (modification_timer)
+                    }
+                }
+            }
+            @if let Some(conf) = actions_conf {
+                td.actions-cell {
+                    (rm_form(conf.rm_route, &entry.link, route_prefix))
+                }
+            }
+        }
+    }
+}
+
+/// Partial: up arrow
+fn arrow_up() -> Markup {
+    PreEscaped("⇪".to_string())
+}
+
+/// Partial: chevron left
+fn chevron_left() -> Markup {
+    PreEscaped("◂".to_string())
+}
+
+/// Partial: chevron up
+fn chevron_up() -> Markup {
+    PreEscaped("▴".to_string())
+}
+
+/// Partial: chevron up
+fn chevron_down() -> Markup {
+    PreEscaped("▾".to_string())
+}
+
+/// Partial: page header
+fn page_header(
+    title: &str,
+    file_upload: bool,
+    web_file_concurrency: usize,
+    api_route: &str,
+    favicon_route: &str,
+    css_route: &str,
+) -> Markup {
+    html! {
+        head {
+            meta charset="utf-8";
+            meta http-equiv="X-UA-Compatible" content="IE=edge";
+            meta name="viewport" content="width=device-width, initial-scale=1";
+            meta name="color-scheme" content="dark light";
+
+            link rel="icon" type="image/svg+xml" href={ (favicon_route) };
+            link rel="stylesheet" href={ (css_route) };
+
+            title { (title) }
+
+            script {
+                (PreEscaped(r#"
+                    // updates the color scheme by setting the theme data attribute
+                    // on body and saving the new theme to local storage
+                    function updateColorScheme(name) {
+                        if (name && name != "default") {
+                            localStorage.setItem('theme', name);
+                            document.body.setAttribute("data-theme", name)
+                        } else {
+                            localStorage.removeItem('theme');
+                            document.body.removeAttribute("data-theme")
+                        }
+                    }
+
+                    // read theme from local storage and apply it to body
+                    function loadColorScheme() {
+                        var name = localStorage.getItem('theme');
+                        updateColorScheme(name);
+                    }
+
+                    // load saved theme on page load
+                    addEventListener("load", loadColorScheme);
+                    // load saved theme when local storage is changed (synchronize between tabs)
+                    addEventListener("storage", loadColorScheme);
+
+                    // handle search form submission
+                    addEventListener("load", function() {
+                        const searchForm = document.getElementById('search');
+                        if (searchForm) {
+                            searchForm.addEventListener('submit', function(event) {
+                                event.preventDefault();
+                                const currentParams = new URLSearchParams(window.location.search);
+                                const searchInput = event.target.elements.search;
+                                currentParams.set('search', searchInput.value);
+                                window.location.search = currentParams.toString();
+                            });
+                        }
+                    });
+                "#))
+            }
+
+            script {
+                (format!("const API_ROUTE = '{api_route}';"))
+                (PreEscaped(r#"
+                    let dirSizeCache = {};
+
+                    // Query the directory size from the miniserve API
+                    function fetchDirSize(dir) {
+                        return fetch(API_ROUTE, {
+                            headers: {
+                                'Accept': 'application/json',
+                                'Content-Type': 'application/json'
+                            },
+                            method: 'POST',
+                            body: JSON.stringify({
+                                DirSize: dir
+                            })
+                        }).then(resp => resp.ok ? resp.text() : "~")
+                    }
+
+                    function updateSizeCells() {
+                        const directoryCells = document.querySelectorAll('tr.entry-type-directory .size-cell');
+
+                        directoryCells.forEach(cell => {
+                            // Get the dir from the sibling anchor tag.
+                            const href = cell.parentNode.querySelector('a').href;
+                            const target = new URL(href).pathname;
+
+                            // First check our local cache
+                            if (target in dirSizeCache) {
+                                cell.dataset.size = dirSizeCache[target];
+                            } else {
+                                fetchDirSize(target).then(dir_size => {
+                                    cell.dataset.size = dir_size;
+                                    dirSizeCache[target] = dir_size;
+                                })
+                                .catch(error => console.error("Error fetching dir size:", error));
+                            }
+                        })
+                    }
+                    setInterval(updateSizeCells, 1000);
+                "#))
+            }
+
+            script {
+                (PreEscaped(r#"
+                    // ===================================================================
+                    // Image gallery: view memory, lightbox, and lazy tree sidebar
+                    // ===================================================================
+                    // NOTE: this script lives in <head>, so the body isn't parsed yet when
+                    // it runs. We wrap everything in initGallery() and defer until the DOM
+                    // is ready, otherwise getElementById('dir-tree'/'lightbox') return null.
+                    function initGallery() {
+                        // --- View mode memory ---
+                        // Remember the chosen view mode across page loads (the server also
+                        // honors ?view= in the URL, this just keeps things in sync).
+                        function currentViewFromUrl() {
+                            const v = new URLSearchParams(window.location.search).get('view');
+                            return v; // may be null
+                        }
+                        function currentPathRelativeToPrefix() {
+                            const prefix = document.body.dataset.routePrefix || '';
+                            const prefixPath = '/' + prefix;
+                            let p = window.location.pathname;
+                            if (p.startsWith(prefixPath)) {
+                                p = p.substring(prefixPath.length);
+                            } else if (p === prefixPath || p === prefixPath + '/') {
+                                p = '';
+                            }
+                            // Strip leading AND trailing slashes so comparisons against
+                            // data-path (which has no trailing slash) are consistent.
+                            return p.replace(/^\/+/, '').replace(/\/+$/, '');
+                        }
+
+                        // --- Lightbox ---
+                        var lightbox = document.getElementById('lightbox');
+                        var lightboxImg = document.getElementById('lightbox-image');
+                        var lightboxCaption = document.getElementById('lightbox-caption');
+                        var currentImages = [];
+                        var currentIndex = 0;
+
+                        function collectImages() {
+                            currentImages = [];
+                            document.querySelectorAll('[data-lightbox="1"]').forEach(function (el) {
+                                var src = el.getAttribute('href') || (el.querySelector('img') && el.querySelector('img').src);
+                                if (src) {
+                                    var name = el.getAttribute('alt') || el.textContent.trim() ||
+                                               (el.parentElement && el.parentElement.querySelector('.grid-name, .album-name') &&
+                                                el.parentElement.querySelector('.grid-name, .album-name').textContent.trim()) || '';
+                                    currentImages.push({ src: src, name: name });
+                                }
+                            });
+                        }
+
+                        function showImage(index) {
+                            if (currentImages.length === 0) return;
+                            currentIndex = (index + currentImages.length) % currentImages.length;
+                            var item = currentImages[currentIndex];
+                            lightboxImg.src = item.src;
+                            lightboxImg.alt = item.name;
+                            lightboxCaption.textContent = (currentIndex + 1) + ' / ' + currentImages.length + (item.name ? ' — ' + item.name : '');
+                        }
+
+                        function openLightbox(src) {
+                            collectImages();
+                            if (currentImages.length === 0 && src) {
+                                currentImages = [{ src: src, name: '' }];
+                            }
+                            var found = src ? currentImages.findIndex(function (i) { return i.src === src; }) : -1;
+                            showImage(found >= 0 ? found : 0);
+                            lightbox.classList.remove('hidden');
+                            document.body.style.overflow = 'hidden';
+                        }
+
+                        function closeLightbox() {
+                            lightbox.classList.add('hidden');
+                            lightboxImg.src = '';
+                            document.body.style.overflow = '';
+                        }
+
+                        if (lightbox) {
+                            lightbox.querySelector('.lightbox-close').addEventListener('click', closeLightbox);
+                            lightbox.querySelector('.lightbox-prev').addEventListener('click', function (e) { e.stopPropagation(); showImage(currentIndex - 1); });
+                            lightbox.querySelector('.lightbox-next').addEventListener('click', function (e) { e.stopPropagation(); showImage(currentIndex + 1); });
+                            lightbox.addEventListener('click', function (e) { if (e.target === lightbox) closeLightbox(); });
+                            document.addEventListener('keydown', function (e) {
+                                if (lightbox.classList.contains('hidden')) return;
+                                if (e.key === 'Escape') closeLightbox();
+                                else if (e.key === 'ArrowLeft') showImage(currentIndex - 1);
+                                else if (e.key === 'ArrowRight') showImage(currentIndex + 1);
+                            });
+                        }
+
+                        // Intercept clicks on image thumbnails to open the lightbox instead of navigating
+                        document.addEventListener('click', function (e) {
+                            var target = e.target.closest('[data-lightbox="1"]');
+                            if (target) {
+                                e.preventDefault();
+                                openLightbox(target.getAttribute('href'));
+                            }
+                        });
+
+                        // --- Lazy directory tree ---
+                        var tree = document.getElementById('dir-tree');
+                        var currentRelPath = currentPathRelativeToPrefix();
+
+                        function buildNode(name, linkPath, isCurrent) {
+                            var li = document.createElement('li');
+                            li.className = 'tree-node';
+                            li.dataset.path = linkPath;
+                            li.dataset.loaded = 'false';
+
+                            var toggle = document.createElement('span');
+                            toggle.className = 'tree-toggle collapsed';
+                            toggle.textContent = '▸';
+                            toggle.title = 'Expand/collapse';
+
+                            var a = document.createElement('a');
+                            a.className = 'tree-link';
+                            a.textContent = name;
+                            // Build a URL that preserves current query params (sort/order/view/search).
+                            // Construct the path from clean segments to avoid accidental double slashes
+                            // (e.g. "//sub1" would be parsed by the browser as host "sub1").
+                            var params = new URLSearchParams(window.location.search);
+                            params.delete('search');
+                            var qs = params.toString();
+                            // data-route-prefix may carry a leading slash (e.g. "/myroot"); strip it.
+                            var prefix = (document.body.dataset.routePrefix || '').replace(/^\/+/, '');
+                            var segments = ['/'];
+                            if (prefix) segments.push(prefix + '/');
+                            if (linkPath) segments.push(linkPath + '/');
+                            a.href = segments.join('') + (qs ? '?' + qs : '');
+
+                            if (isCurrent) li.classList.add('current');
+
+                            var children = document.createElement('ul');
+                            children.className = 'tree-children';
+                            children.hidden = true;
+
+                            li.appendChild(toggle);
+                            li.appendChild(a);
+                            li.appendChild(children);
+                            return li;
+                        }
+
+                        function fetchChildren(path, ul, onComplete) {
+                            return fetch(API_ROUTE, {
+                                headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
+                                method: 'POST',
+                                body: JSON.stringify({ ListDirs: { path: path } })
+                            }).then(function (r) { return r.ok ? r.json() : { dirs: [] }; })
+                              .then(function (data) {
+                                  var dirs = (data && data.dirs) || [];
+                                  dirs.forEach(function (d) {
+                                      // d.link is relative to serve root, with trailing slash
+                                      var childPath = d.link.replace(/\/+$/, '');
+                                      var node = buildNode(d.name, childPath, false);
+                                      // Highlight the node that is an ancestor of the current path
+                                      if (currentRelPath.startsWith(childPath + '/')) {
+                                          node.classList.add('ancestor');
+                                      }
+                                      ul.appendChild(node);
+                                  });
+                                  if (onComplete) onComplete(dirs.length);
+                              }).catch(function () { if (onComplete) onComplete(0); });
+                        }
+
+                        function toggleNode(node) {
+                            var toggle = node.querySelector(':scope > .tree-toggle');
+                            var children = node.querySelector(':scope > .tree-children');
+                            if (!children) return;
+                            if (node.dataset.loaded === 'false') {
+                                node.classList.add('loading');
+                                fetchChildren(node.dataset.path, children, function () {
+                                    node.dataset.loaded = 'true';
+                                    node.classList.remove('loading');
+                                    children.hidden = false;
+                                    toggle.classList.remove('collapsed');
+                                    toggle.classList.add('expanded');
+                                    toggle.textContent = '▾';
+                                });
+                            } else {
+                                var collapsed = children.hidden;
+                                children.hidden = !collapsed;
+                                if (collapsed) {
+                                    toggle.classList.remove('collapsed');
+                                    toggle.classList.add('expanded');
+                                    toggle.textContent = '▾';
+                                } else {
+                                    toggle.classList.add('collapsed');
+                                    toggle.classList.remove('expanded');
+                                    toggle.textContent = '▸';
+                                }
+                            }
+                        }
+
+                        if (tree) {
+                            tree.addEventListener('click', function (e) {
+                                if (e.target.classList.contains('tree-toggle')) {
+                                    e.preventDefault();
+                                    var node = e.target.closest('.tree-node');
+                                    if (node) toggleNode(node);
+                                }
+                            });
+
+                            // Auto-expand the root, then walk down the current path's ancestors so the
+                            // current directory is visible in the tree on page load.
+                            var rootNode = tree.querySelector('.tree-node.root');
+                            function expandAncestors(prefix) {
+                                var node = tree.querySelector('.tree-node[data-path="' + cssEscape(prefix) + '"]');
+                                if (!node) return;
+                                var children = node.querySelector(':scope > .tree-children');
+                                if (node.dataset.loaded === 'false') {
+                                    node.classList.add('loading');
+                                    fetchChildren(node.dataset.path, children, function (count) {
+                                        node.dataset.loaded = 'true';
+                                        node.classList.remove('loading');
+                                        children.hidden = false;
+                                        var t = node.querySelector(':scope > .tree-toggle');
+                                        t.classList.remove('collapsed'); t.classList.add('expanded'); t.textContent = '▾';
+                                        // find next path segment
+                                        var rest = currentRelPath.substring(prefix.length).replace(/^\/+/, '');
+                                        var next = rest.split('/')[0];
+                                        if (next) {
+                                            expandAncestors(prefix ? prefix + '/' + next : next);
+                                        } else {
+                                            // mark the current node
+                                            var cur = tree.querySelector('.tree-node[data-path="' + cssEscape(currentRelPath) + '"]');
+                                            if (cur) cur.classList.add('current');
+                                        }
+                                    });
+                                }
+                            }
+
+                            // Minimal CSS.escape polyfill-ish for our needs
+                            function cssEscape(s) {
+                                return (window.CSS && CSS.escape) ? CSS.escape(s) : s.replace(/["\\]/g, '\\$&');
+                            }
+
+                            if (rootNode) {
+                                // expand root first
+                                var rootChildren = rootNode.querySelector(':scope > .tree-children');
+                                rootNode.classList.add('loading');
+                                fetchChildren('', rootChildren, function () {
+                                    rootNode.dataset.loaded = 'true';
+                                    rootNode.classList.remove('loading');
+                                    rootChildren.hidden = false;
+                                    var t = rootNode.querySelector(':scope > .tree-toggle');
+                                    t.classList.remove('collapsed'); t.classList.add('expanded'); t.textContent = '▾';
+                                    if (currentRelPath) {
+                                        var first = currentRelPath.split('/')[0];
+                                        if (first) expandAncestors(first);
+                                    }
+                                });
+                            }
+                        }
+                    }
+
+                    // Run the gallery logic once the DOM is fully parsed. Since this script
+                    // is in <head>, the body may not exist yet at parse time.
+                    if (document.readyState === 'loading') {
+                        document.addEventListener('DOMContentLoaded', initGallery);
+                    } else {
+                        initGallery();
+                    }
+                "#))
+            }
+
+            @if file_upload {
+                script {
+                    (format!("const CONCURRENCY = {web_file_concurrency};"))
+                    (PreEscaped(r#"
+                    window.onload = function() {
+                        // Constants
+                        const UPLOADING = 'uploading', PENDING = 'pending', COMPLETE = 'complete', CANCELLED = 'cancelled', FAILED = 'failed'
+                        const UPLOAD_ITEM_ORDER = { UPLOADING: 0, PENDING: 1, COMPLETE: 2, CANCELLED: 3, FAILED: 4 }
+                        let CANCEL_UPLOAD = false;
+
+                        // File Upload dom elements. Used for interacting with the
+                        // upload container.
+                        const form = document.querySelector('#file_submit');
+                        const uploadArea = document.querySelector('#upload_area');
+                        const uploadTitle = document.querySelector('#upload_title');
+                        const uploadActionText = document.querySelector('#upload_action_text');
+                        const uploadCancelButton = document.querySelector('#upload_cancel');
+                        const uploadList = document.querySelector('#upload_file_list');
+                        const fileUploadItemTemplate = document.querySelector('#upload_file_item');
+                        const uploadWidgetToggle = document.querySelector('#upload-toggle');
+
+                        const dropContainer = document.querySelector('#drop-container');
+                        const dragForm = document.querySelector('.drag-form');
+                        const fileInput = document.querySelector('#file-input');
+                        const collection = [];
+
+                        dropContainer.ondragover = function(e) {
+                            e.preventDefault();
+                        }
+
+                        dropContainer.ondragenter = function(e) {
+                            e.preventDefault();
+                            if (collection.length === 0) {
+                                dragForm.style.display = 'initial';
+                            }
+                            collection.push(e.target);
+                        };
+
+                        dropContainer.ondragleave = function(e) {
+                            e.preventDefault();
+                            collection.splice(collection.indexOf(e.target), 1);
+                            if (collection.length === 0) {
+                                dragForm.style.display = 'none';
+                            }
+                        };
+
+                        dropContainer.ondrop = function(e) {
+                            e.preventDefault();
+                            fileInput.files = e.dataTransfer.files;
+                            form.requestSubmit();
+                            dragForm.style.display = 'none';
+                        };
+
+                        // Event listener for toggling the upload widget display on mobile.
+                        uploadWidgetToggle.addEventListener('click', function (e) {
+                            e.preventDefault();
+                            if (uploadArea.style.height === "100vh") {
+                                uploadArea.style = ""
+                                document.body.style = ""
+                                uploadWidgetToggle.style = ""
+                            } else {
+                                uploadArea.style.height = "100vh"
+                                document.body.style = "overflow: hidden"
+                                uploadWidgetToggle.style = "transform: rotate(180deg)"
+                            }
+                        })
+
+                        // Cancel all active and pending uploads
+                        uploadCancelButton.addEventListener('click', function (e) {
+                            e.preventDefault();
+                            CANCEL_UPLOAD = true;
+                        })
+
+                        form.addEventListener('submit', function (e) {
+                            e.preventDefault()
+                            uploadFiles()
+                        })
+
+                        // When uploads start, finish or are cancelled, the UI needs to reactively shows those
+                        // updates of the state. This function updates the text on the upload widget to accurately
+                        // show the state of all uploads.
+                        function updateUploadTextAndList() {
+                            // All state is kept as `data-*` attributed on the HTML node.
+                            const queryLength = (state) => document.querySelectorAll(`[data-state='${state}']`).length;
+                            const total = document.querySelectorAll("[data-state]").length;
+                            const uploads = queryLength(UPLOADING);
+                            const pending = queryLength(PENDING);
+                            const completed = queryLength(COMPLETE);
+                            const cancelled = queryLength(CANCELLED);
+                            const failed = queryLength(FAILED);
+                            const allCompleted = completed + cancelled + failed;
+
+                            // Update header text based on remaining uploads
+                            let headerText = `${total - allCompleted} uploads remaining...`;
+                            if (total === allCompleted) {
+                                headerText = `Complete! Reloading Page!`
+                            }
+
+                            // Build a summary of statuses for sub header
+                            const statuses = []
+                            if (uploads > 0) { statuses.push(`Uploading ${uploads}`) }
+                            if (pending > 0) { statuses.push(`Pending ${pending}`) }
+                            if (completed > 0) { statuses.push(`Complete ${completed}`) }
+                            if (cancelled > 0) { statuses.push(`Cancelled ${cancelled}`) }
+                            if (failed > 0) { statuses.push(`Failed ${failed}`) }
+
+                            uploadTitle.textContent = headerText
+                            uploadActionText.textContent = statuses.join(', ')
+                        }
+
+                        // Initiates the file upload process by disabling the ability for more files to be
+                        // uploaded and creating async callbacks for each file that needs to be uploaded.
+                        // Given the concurrency set by the server input arguments, it will try to process
+                        // that many uploads at once
+                        function uploadFiles() {
+                            fileInput.disabled = true;
+
+                            // Map all the files into async callbacks (uploadFile is a function that returns a function)
+                            const callbacks = Array.from(fileInput.files).map(uploadFile);
+
+                            // Get a list of all the callbacks
+                            const concurrency = CONCURRENCY === 0 ? callbacks.length : CONCURRENCY;
+
+                            // Worker function that continuously pulls tasks from the shared queue.
+                            async function worker() {
+                                while (callbacks.length > 0) {
+                                    // Remove a task from the front of the queue.
+                                    const task = callbacks.shift();
+                                    if (task) {
+                                        await task();
+                                        updateUploadTextAndList();
+                                    }
+                                }
+                            }
+
+                            // Create a work stealing shared queue, split up between `concurrency` amount of workers.
+                            const workers = Array.from({ length: concurrency }).map(worker);
+
+                            // Wait for all the workers to complete
+                            Promise.allSettled(workers)
+                                .finally(() => {
+                                    updateUploadTextAndList();
+                                    form.reset();
+                                    setTimeout(() => { uploadArea.classList.remove('active'); }, 1000)
+                                    setTimeout(() => { window.location.reload(); }, 1500)
+                                })
+
+                            updateUploadTextAndList();
+                            uploadArea.classList.add('active')
+                            uploadList.scrollTo(0, 0)
+                        }
+
+                        function formatBytes(bytes, decimals) {
+                            if (bytes == 0) return '0 Bytes';
+                            var k = 1024,
+                                dm = decimals || 2,
+                                sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB', 'YB'],
+                                i = Math.floor(Math.log(bytes) / Math.log(k));
+                            return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+                        }
+
+                        document.querySelector('input[type="file"]').addEventListener('change', async (e) => {
+                          const file = e.target.files[0];
+                        });
+
+                        async function get256FileHash(file) {
+                          const arrayBuffer = await file.arrayBuffer();
+                          const hashBuffer = await crypto.subtle.digest('SHA-256', arrayBuffer);
+                          const hashArray = Array.from(new Uint8Array(hashBuffer));
+                          return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+                        }
+
+                        // Upload a file. This function will create a upload item in the upload
+                        // widget from an HTML template. It then returns a promise which will
+                        // be used to upload the file to the server and control the styles and
+                        // interactions on the HTML list item.
+                        function uploadFile(file) {
+                            const fileUploadItem = fileUploadItemTemplate.content.cloneNode(true)
+                            const itemContainer = fileUploadItem.querySelector(".upload_file_item")
+                            const itemText = fileUploadItem.querySelector(".upload_file_text")
+                            const size = fileUploadItem.querySelector(".file_size")
+                            const name = fileUploadItem.querySelector(".file_name")
+                            const percentText = fileUploadItem.querySelector(".file_upload_percent")
+                            const bar = fileUploadItem.querySelector(".file_progress_bar")
+                            const cancel = fileUploadItem.querySelector(".file_cancel_upload")
+                            let preCancel = false;
+
+                            itemContainer.dataset.state = PENDING
+                            name.textContent = file.name
+                            size.textContent = formatBytes(file.size)
+                            percentText.textContent = "0%"
+
+                            uploadList.append(fileUploadItem)
+
+                            // Cancel an upload before it even started.
+                            function preCancelUpload() {
+                                preCancel = true;
+                                itemText.classList.add(CANCELLED);
+                                bar.classList.add(CANCELLED);
+                                itemContainer.dataset.state = CANCELLED;
+                                itemContainer.style.background = 'var(--upload_modal_file_upload_complete_background)';
+                                cancel.disabled = true;
+                                cancel.removeEventListener("click", preCancelUpload);
+                                uploadCancelButton.removeEventListener("click", preCancelUpload);
+                                updateUploadTextAndList();
+                            }
+
+                            uploadCancelButton.addEventListener("click", preCancelUpload)
+                            cancel.addEventListener("click", preCancelUpload)
+
+                            // A callback function is return so that the upload doesn't start until
+                            // we want it to. This is so that we have control over our desired concurrency.
+                            return () => {
+                                if (preCancel) {
+                                    return Promise.resolve()
+                                }
+
+                                // Upload the single file in a multipart request.
+                                return new Promise(async (resolve, reject) => {
+                                    // File hash calculation may fail at times:
+                                    //   1. `crypto.subtle` is not available in nonsecure context (e.g. non-HTTPS LAN).
+                                    //      See https://developer.mozilla.org/en-US/docs/Web/API/Crypto/subtle
+                                    //   2. For files larger than 2GB, Firefox will refuse to calculate the SHA-256 value,
+                                    //      while Chrome will refuse to create a ArrayBuffer (#1541).
+                                    const fileHash = await get256FileHash(file).catch(() => "");
+                                    const xhr = new XMLHttpRequest();
+                                    const formData = new FormData();
+                                    formData.append('file', file);
+
+                                    function onReadyStateChange(e) {
+                                        if (e.target.readyState == 4) {
+                                            if (e.target.status == 200) {
+                                                completeSuccess()
+                                            } else {
+                                                failedUpload(e.target.status)
+                                            }
+                                        }
+                                    }
+
+                                    function onError(e) {
+                                        failedUpload()
+                                    }
+
+                                    function onAbort(e) {
+                                        cancelUpload()
+                                    }
+
+                                    function onProgress (e) {
+                                        update(Math.round((e.loaded / e.total) * 100));
+                                    }
+
+                                    function update(uploadPercent) {
+                                        let wholeNumber = Math.floor(uploadPercent)
+                                        percentText.textContent = `${wholeNumber}%`
+                                        bar.style.width = `${wholeNumber}%`
+                                    }
+
+                                    function completeSuccess() {
+                                        cancel.textContent = '✔';
+                                        cancel.classList.add(COMPLETE);
+                                        bar.classList.add(COMPLETE);
+                                        cleanUp(COMPLETE)
+                                    }
+
+                                    function failedUpload(statusCode) {
+                                        cancel.textContent = `${statusCode} ⚠`;
+                                        itemText.classList.add(FAILED);
+                                        bar.classList.add(FAILED);
+                                        cleanUp(FAILED);
+                                    }
+
+                                    function cancelUpload() {
+                                        xhr.abort()
+                                        itemText.classList.add(CANCELLED);
+                                        bar.classList.add(CANCELLED);
+                                        cleanUp(CANCELLED);
+                                    }
+
+                                    function cleanUp(state) {
+                                        itemContainer.dataset.state = state;
+                                        itemContainer.style.background = 'var(--upload_modal_file_upload_complete_background)';
+                                        cancel.disabled = true;
+                                        cancel.removeEventListener("click", cancelUpload)
+                                        uploadCancelButton.removeEventListener("click", cancelUpload)
+                                        xhr.removeEventListener('readystatechange', onReadyStateChange);
+                                        xhr.removeEventListener("error", onError);
+                                        xhr.removeEventListener("abort", onAbort);
+                                        xhr.upload.removeEventListener('progress', onProgress);
+                                        resolve()
+                                    }
+
+                                    uploadCancelButton.addEventListener("click", cancelUpload)
+                                    cancel.addEventListener("click", cancelUpload)
+
+                                    if (CANCEL_UPLOAD) {
+                                        cancelUpload()
+                                    } else {
+                                        itemContainer.dataset.state = UPLOADING
+                                        xhr.addEventListener('readystatechange', onReadyStateChange);
+                                        xhr.addEventListener("error", onError);
+                                        xhr.addEventListener("abort", onAbort);
+                                        xhr.upload.addEventListener('progress', onProgress);
+                                        xhr.open('post', form.getAttribute("action"), true);
+                                        if (fileHash) {
+                                            xhr.setRequestHeader('X-File-Hash', fileHash);
+                                            xhr.setRequestHeader('X-File-Hash-Function', 'SHA256');
+                                        }
+                                        xhr.send(formData);
+                                    }
+                                })
+                            }
+                        }
+
+                        // Bind pastebin submission to create a text/plain blob which is injected
+                        // into the upload input then submitted. A title is automatically generated
+                        // if none is given.
+                        const fileUploadForm = document.querySelector('#file_submit');
+                        const fileUploadInput = document.querySelector('#file_submit input[type=file]');
+                        const pastebinForm = document.querySelector('form#pastebin');
+                        if (pastebinForm) {
+                            const pastebinFilename = pastebinForm.querySelector('input[name=paste_filename]');
+                            const pastebinContent = pastebinForm.querySelector('textarea');
+                            pastebinContent.addEventListener('keydown', (event) => {
+                                // common convenience of ctrl-enter to submit
+                                if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+                                    event.preventDefault();
+                                    event.target.form.requestSubmit();
+                                }
+                            });
+
+                            pastebinForm.addEventListener('submit', (event) => {
+                                // The pastebin form is "dead" and should not cause any page-submit
+                                // events. We capture the pastebin form content, convert it into a
+                                // in-memory blob, then pass that blob to the regular fileUpload form
+                                // for submission, as if a user and selected a real file.
+                                event.preventDefault();
+                                const text = pastebinContent.value;
+                                const title = ((inputValue) => {
+                                    const title = inputValue.trim();
+                                    if (title.length === 0) {
+                                        let suffix;
+                                        if (crypto.randomUUID !== undefined) {
+                                            suffix = crypto.randomUUID().substring(0,6);
+                                        } else {
+                                            // neither HTTPS nor "localhost"
+                                            suffix = Date.now().toString(16).slice(-6);
+                                        }
+                                        return `paste-${suffix}.txt`;
+                                    } else {
+                                        // use given extension if one is present, otherwise make it
+                                        // .txt. We're quite liberal in what we consider an extension,
+                                        // any number of alpha-numeric after a dot.
+                                        if (/\.[0-9a-z]+$/i.test(title)) {
+                                            return title;
+                                        } else {
+                                            return `${title}.txt`;
+                                        }
+                                    }
+                                })(pastebinFilename.value);
+                                // Package text as a file and submit
+                                const blob = new Blob([text], {type: 'text/plain'});
+                                const file = new File([blob], title, {type: 'text/plain'});
+                                const container = new DataTransfer();
+                                container.items.add(file);
+                                fileUploadInput.files = container.files;
+                                fileUploadForm.submit();
+                            });
+                        }
+                    }
+                    "#))
+                }
+            }
+        }
+    }
+}
+
+/// Converts a SystemTime object to a strings tuple (date, time)
+fn convert_to_local(src_time: Option<SystemTime>) -> Option<String> {
+    src_time
+        .map(DateTime::<Local>::from)
+        .map(|date_time| date_time.format("%Y-%m-%d %H:%M:%S %:z").to_string())
+}
+
+/// Converts a SystemTime to a string readable by a human,
+/// and gives a rough approximation of the elapsed time since
+fn humanize_systemtime(time: Option<SystemTime>) -> Option<String> {
+    time.map(|time| time.humanize())
+}
+
+/// Renders an error on the webpage
+pub fn render_error(
+    error_description: &str,
+    error_code: StatusCode,
+    conf: &MiniserveConfig,
+    return_address: &str,
+) -> Markup {
+    html! {
+        (DOCTYPE)
+        html {
+            (page_header(&error_code.to_string(), false, conf.web_upload_concurrency, &conf.api_route, &conf.favicon_route, &conf.css_route))
+
+            body
+            {
+                div.error {
+                    p { (error_code.to_string()) }
+                    @for error in error_description.lines() {
+                        p { (error) }
+                    }
+                    // WARN don't expose random route!
+                    @if conf.route_prefix.is_empty() && !conf.disable_indexing {
+                        div.error-nav {
+                            a.error-back href=(return_address) {
+                                "Go back to file listing"
+                            }
+                        }
+                    }
+                    @if !conf.hide_version_footer {
+                        p.footer {
+                            (version_footer())
+                        }
+
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    fn to_html(wget_part: &str) -> String {
+        format!(
+            r#"<div class="downloadDirectory"><p>Download folder:</p><a class="cmd" title="Click to copy!" style="cursor: pointer;" onclick="navigator.clipboard.writeText(&quot;wget -rcnp -R 'index.html*' {wget_part}/?raw=true'&quot;)">wget -rcnp -R 'index.html*' {wget_part}/?raw=true'</a></div>"#
+        )
+    }
+
+    fn uri(x: &str) -> Uri {
+        Uri::try_from(x).unwrap()
+    }
+
+    #[test]
+    fn test_wget_footer_trivial() {
+        let to_be_tested: String =
+            wget_footer(&uri("https://github.com/"), None, None, None).into();
+        let expected = to_html("-nH -P 'github.com' 'https://github.com");
+        assert_eq!(to_be_tested, expected);
+    }
+
+    #[test]
+    fn test_wget_footer_with_root_dir() {
+        let to_be_tested: String = wget_footer(
+            &uri("https://github.com/svenstaro/miniserve/"),
+            Some("Miniserve"),
+            None,
+            None,
+        )
+        .into();
+        let expected = to_html("-nH --cut-dirs=1 'https://github.com/svenstaro/miniserve");
+        assert_eq!(to_be_tested, expected);
+    }
+
+    #[test]
+    fn test_wget_footer_with_root_dir_and_user() {
+        let to_be_tested: String = wget_footer(
+            &uri("http://1und1.de/"),
+            Some("1&1 - Willkommen!!!"),
+            Some("Marcell D'Avis"),
+            None,
+        )
+        .into();
+        let expected = to_html(
+            "-nH -P '1&amp;1 - Willkommen!!!' --ask-password --user 'Marcell D'&quot;'&quot;'Avis' 'http://1und1.de",
+        );
+        assert_eq!(to_be_tested, expected);
+    }
+
+    #[test]
+    fn test_wget_footer_escaping() {
+        let to_be_tested: String = wget_footer(
+            &uri("http://127.0.0.1:1234/geheime_dokumente.php/"),
+            Some("Streng Geheim!!!"),
+            Some("uøý`¶'7ÅÛé"),
+            None,
+        )
+        .into();
+        let expected = to_html(
+            "-nH --ask-password --user 'uøý`¶'&quot;'&quot;'7ÅÛé' 'http://127.0.0.1:1234/geheime_dokumente.php",
+        );
+        assert_eq!(to_be_tested, expected);
+    }
+
+    #[test]
+    fn test_wget_footer_ip() {
+        let to_be_tested: String =
+            wget_footer(&uri("http://127.0.0.1:420/"), None, None, None).into();
+        let expected = to_html("-nH -P '127.0.0.1:420' 'http://127.0.0.1:420");
+        assert_eq!(to_be_tested, expected);
+    }
+
+    #[test]
+    fn test_wget_footer_externalurl() {
+        let to_be_tested: String = wget_footer(
+            &uri("https://github.com/"),
+            None,
+            None,
+            Some("https://gitlab.com"),
+        )
+        .into();
+        let expected = to_html("-H -P 'github.com' 'https://github.com");
+        assert_eq!(to_be_tested, expected);
+    }
+
+    #[test]
+    fn test_rm_form_strips_prefix() {
+        let rm_route = "/rm";
+        let prefix = "/prefix";
+        let encoded_path = "/prefix/some/path/file.txt";
+
+        let html = rm_form(rm_route, encoded_path, prefix);
+        let expected_action = r#"action="/rm?path=/some/path/file.txt""#;
+
+        assert!(
+            html.0.contains(expected_action),
+            "Actual HTML: {}\nExpected to contain: {}",
+            html.0,
+            expected_action
+        )
+    }
+}
