@@ -24,7 +24,8 @@ use dav_server::{
 use fast_qr::QRBuilder;
 use log::{error, info, trace, warn};
 use percent_encoding::percent_decode_str;
-use serde::Deserialize;
+use percent_encoding::utf8_percent_encode;
+use serde::{Deserialize, Serialize};
 
 mod archive;
 mod args;
@@ -490,6 +491,22 @@ async fn healthcheck() -> impl Responder {
 enum ApiCommand {
     /// Request the size of a particular directory
     DirSize(String),
+    /// Request the list of subdirectories of a particular directory (for the tree sidebar)
+    ListDirs { path: String },
+}
+
+/// A single subdirectory entry returned by the `ListDirs` API command.
+#[derive(Serialize)]
+struct DirEntry {
+    name: String,
+    /// Path relative to the serve root, percent-encoded, with a trailing slash
+    link: String,
+}
+
+/// Response body of the `ListDirs` API command.
+#[derive(Serialize)]
+struct ListDirsResponse {
+    dirs: Vec<DirEntry>,
 }
 
 /// This "API" is pretty shitty but frankly miniserve doesn't really need a very fancy API. Or at
@@ -518,15 +535,87 @@ async fn api(
                 info!("Requested directory listing for {full_path:?}");
 
                 let dir_size = recursive_dir_size(&full_path).await?;
-                if config.show_exact_bytes {
-                    Ok(format!("{dir_size} B"))
+                let body = if config.show_exact_bytes {
+                    format!("{dir_size} B")
                 } else {
                     let dir_size = ByteSize::b(dir_size);
-                    Ok(dir_size.to_string())
-                }
+                    dir_size.to_string()
+                };
+                Ok(HttpResponse::Ok().body(body))
             } else {
-                Ok("-".to_string())
+                Ok(HttpResponse::Ok().body("-".to_string()))
             }
+        }
+        ApiCommand::ListDirs { path } => {
+            use crate::listing::percent_encode_sets::COMPONENT;
+
+            // Decode the percent-encoded path coming from the browser.
+            let decoded_path = percent_decode_str(&path)
+                .decode_utf8()
+                .map_err(|e| RuntimeError::ParseError(path.clone(), e.to_string()))?;
+
+            // Resolve it to an absolute path on the filesystem (relative to serve root).
+            // Allow traversing hidden directories so the tree can show them when --hidden is set.
+            let sanitized = file_utils::sanitize_path(&*decoded_path, true)
+                .ok_or_else(|| RuntimeError::ParseError(path.clone(), "invalid path".into()))?;
+
+            let root = config
+                .path
+                .canonicalize()
+                .map_err(|e| RuntimeError::IoError(path.clone(), io::Error::other(e)))?;
+            let full_path = root.join(&sanitized);
+
+            let mut dirs: Vec<DirEntry> = Vec::new();
+            if let Ok(read_dir) = std::fs::read_dir(&full_path) {
+                for entry in read_dir.flatten() {
+                    let file_name = entry.file_name().to_string_lossy().to_string();
+                    // Respect hidden file setting
+                    if !config.show_hidden && file_name.starts_with('.') {
+                        continue;
+                    }
+                    // Only directories (resolve symlink metadata)
+                    let is_dir = match std::fs::metadata(entry.path()) {
+                        Ok(md) => md.is_dir(),
+                        Err(_) => false,
+                    };
+                    if !is_dir {
+                        continue;
+                    }
+                    // Honor --no-symlinks for the tree as well
+                    if config.no_symlinks
+                        && entry
+                            .metadata()
+                            .map(|m| m.file_type().is_symlink())
+                            .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    // Build a link relative to the serve root (matching the path the file
+                    // listing would use), percent-encoded, with a trailing slash.
+                    let rel = if sanitized.as_os_str().is_empty() {
+                        utf8_percent_encode(&file_name, COMPONENT).to_string()
+                    } else {
+                        format!(
+                            "{}/{}",
+                            sanitized
+                                .to_string_lossy()
+                                .replace('\\', "/")
+                                .trim_end_matches('/'),
+                            utf8_percent_encode(&file_name, COMPONENT)
+                        )
+                    };
+                    dirs.push(DirEntry {
+                        name: file_name,
+                        link: format!("{rel}/"),
+                    });
+                }
+            }
+            // Sort alphabetically for a stable tree.
+            dirs.sort_by(|a, b| {
+                alphanumeric_sort::compare_str(a.name.to_lowercase(), b.name.to_lowercase())
+            });
+
+            Ok(HttpResponse::Ok().json(ListDirsResponse { dirs }))
         }
     }
 }

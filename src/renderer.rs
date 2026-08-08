@@ -16,7 +16,7 @@ use strum::{Display, IntoEnumIterator};
 use crate::auth::CurrentUser;
 use crate::consts;
 use crate::listing::{
-    Breadcrumb, Entry, ListingQueryParameters, SortingMethod, SortingOrder,
+    Breadcrumb, Entry, ListingQueryParameters, SortingMethod, SortingOrder, ViewMode,
     percent_encode_sets::COMPONENT,
 };
 use crate::{MiniserveConfig, archive::ArchiveMethod};
@@ -34,10 +34,11 @@ pub fn page(
     conf: &MiniserveConfig,
     current_user: Option<&CurrentUser>,
 ) -> Markup {
-    let (sort_method, sort_order, search) = (
+    let (sort_method, sort_order, search, view) = (
         query_params.sort,
         query_params.order,
         query_params.search.as_deref(),
+        query_params.view.unwrap_or(conf.default_view),
     );
 
     // If query_params.raw is true, we want render a minimal directory listing
@@ -75,7 +76,7 @@ pub fn page(
         html {
             (page_header(&title_path, conf.file_upload, conf.web_upload_concurrency, &conf.api_route, &conf.favicon_route, &conf.css_route))
 
-            body #drop-container
+            body #drop-container data-route-prefix=(conf.route_prefix) data-encoded-dir=(encoded_dir)
             {
                 div.toolbar_box_group {
                     @if conf.file_upload {
@@ -96,7 +97,6 @@ pub fn page(
                 }
                 nav {
                     (qr_spoiler(conf.show_qrcode, abs_uri))
-                    (color_scheme_selector(conf.hide_theme_selector))
                 }
                 div.container {
                     span #top { }
@@ -107,7 +107,7 @@ pub fn page(
                                     // wrapped in span so the text doesn't shift slightly when it turns into a link
                                     span { bdi { (el.name) } }
                                 } @else {
-                                    a href=(parametrized_link(&el.link, sort_method, sort_order, false, search)) {
+                                    a href=(parametrized_link(&el.link, sort_method, sort_order, false, search, Some(view))) {
                                         bdi { (el.name) }
                                     }
                                 }
@@ -119,6 +119,8 @@ pub fn page(
                                 input type="text" name="search" value=(search.unwrap_or_default()) placeholder="Search..." {}
                                 button type="submit" { "Search" }
                             }
+                            (view_switcher(view, sort_method, sort_order, search))
+                            (color_scheme_selector(conf.hide_theme_selector))
                         }
                     }
                     div.toolbar {
@@ -170,52 +172,106 @@ pub fn page(
                             }
                         }
                     }
-                    table {
-                        thead {
-                            th.name { (sortable_title("name", "Name", sort_method, sort_order, search)) }
-                            th.size { (sortable_title("size", "Size", sort_method, sort_order, search)) }
-                            th.date { (sortable_title("date", "Last modification", sort_method, sort_order, search)) }
-                            @if show_actions {
-                                th.actions { span { "Actions" } }
+                    div.workspace {
+                        aside.tree-sidebar {
+                            div.tree-header { "Directories" }
+                            ul.tree id="dir-tree" {
+                                li.tree-node.root data-path="" data-loaded="false" {
+                                    span.tree-toggle.collapsed title="Expand/collapse" { "▸" }
+                                    a.tree-link href=(parametrized_link(".", sort_method, sort_order, false, search, Some(view))) {
+                                        (title_path.split('/').next().unwrap_or("root").to_string())
+                                    }
+                                    ul.tree-children hidden { }
+                                }
                             }
                         }
-                        tbody {
-                            @if !is_root {
-                                tr {
-                                    td colspan=(3 + show_actions as usize) {
-                                        p {
-                                            span.root-chevron { (chevron_left()) }
-                                            a.root href=(parametrized_link("../", sort_method, sort_order, false, search)) {
-                                                "Parent directory"
+                        div.content-area {
+                            @match view {
+                                ViewMode::List => {
+                                    table {
+                                        thead {
+                                            th.name { (sortable_title("name", "Name", sort_method, sort_order, search)) }
+                                            th.size { (sortable_title("size", "Size", sort_method, sort_order, search)) }
+                                            th.date { (sortable_title("date", "Last modification", sort_method, sort_order, search)) }
+                                            @if show_actions {
+                                                th.actions { span { "Actions" } }
+                                            }
+                                        }
+                                        tbody {
+                                            @if !is_root {
+                                                tr {
+                                                    td colspan=(3 + show_actions as usize) {
+                                                        p {
+                                                            span.root-chevron { (chevron_left()) }
+                                                            a.root href=(parametrized_link("../", sort_method, sort_order, false, search, Some(view))) {
+                                                                "Parent directory"
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            @for entry in entries {
+                                                (entry_row(entry, sort_method, sort_order, false, search, conf.show_exact_bytes, actions_conf, &conf.route_prefix, Some(view)))
                                             }
                                         }
                                     }
                                 }
+                                ViewMode::Grid => {
+                                    div.grid-view {
+                                        @if !is_root {
+                                            a.grid-card.parent-card href=(parametrized_link("../", sort_method, sort_order, false, search, Some(view))) {
+                                                div.grid-thumb { "📁" }
+                                                div.grid-name { "Parent directory" }
+                                            }
+                                        }
+                                        @for entry in entries {
+                                            (entry_card(entry, sort_method, sort_order, search, conf.show_exact_bytes, actions_conf, &conf.route_prefix, view))
+                                        }
+                                    }
+                                }
+                                ViewMode::Album => {
+                                    div.album-view {
+                                        @if !is_root {
+                                            a.album-tile.parent-tile href=(parametrized_link("../", sort_method, sort_order, false, search, Some(view))) {
+                                                div.album-bg { "📁" }
+                                                div.album-name { "Parent directory" }
+                                            }
+                                        }
+                                        @for entry in entries {
+                                            (entry_tile(entry, sort_method, sort_order, search, conf.show_exact_bytes, actions_conf, &conf.route_prefix, view))
+                                        }
+                                    }
+                                }
                             }
-                            @for entry in entries {
-                                (entry_row(entry, sort_method, sort_order, false, search, conf.show_exact_bytes, actions_conf, &conf.route_prefix))
+                            @if let Some(readme) = readme {
+                                div id="readme" {
+                                    h3 id="readme-filename" { (readme.0) }
+                                    div id="readme-contents" {
+                                        (PreEscaped (readme.1))
+                                    };
+                                }
+                            }
+                            a.back href="#top" {
+                                (arrow_up())
+                            }
+                            div.footer {
+                                @if conf.show_wget_footer {
+                                    (wget_footer(abs_uri, conf.title.as_deref(), current_user.map(|x| &*x.name),
+                                        conf.file_external_url.as_deref()))
+                                }
+                                @if !conf.hide_version_footer {
+                                    (version_footer())
+                                }
                             }
                         }
                     }
-                    @if let Some(readme) = readme {
-                        div id="readme" {
-                            h3 id="readme-filename" { (readme.0) }
-                            div id="readme-contents" {
-                                (PreEscaped (readme.1))
-                            };
-                        }
-                    }
-                    a.back href="#top" {
-                        (arrow_up())
-                    }
-                    div.footer {
-                        @if conf.show_wget_footer {
-                            (wget_footer(abs_uri, conf.title.as_deref(), current_user.map(|x| &*x.name),
-                                conf.file_external_url.as_deref()))
-                        }
-                        @if !conf.hide_version_footer {
-                            (version_footer())
-                        }
+                    // Lightbox modal for image preview
+                    div.lightbox-modal.hidden #lightbox {
+                        button.lightbox-close title="Close (Esc)" { "✕" }
+                        button.lightbox-prev title="Previous" { "‹" }
+                        button.lightbox-next title="Next" { "›" }
+                        img.lightbox-image #lightbox-image alt="Preview" {}
+                        div.lightbox-caption #lightbox-caption {}
                     }
                 }
                 div.upload_area id="upload_area" {
@@ -279,7 +335,7 @@ pub fn raw(
                             tr {
                                 td colspan="3" {
                                     p {
-                                        a.root href=(parametrized_link("../", None, None, true, search)) {
+                                        a.root href=(parametrized_link("../", None, None, true, search, None)) {
                                             ".."
                                         }
                                     }
@@ -287,7 +343,7 @@ pub fn raw(
                             }
                         }
                         @for entry in entries {
-                            (entry_row(entry, None, None, true, search, conf.show_exact_bytes, None, &conf.route_prefix))
+                            (entry_row(entry, None, None, true, search, conf.show_exact_bytes, None, &conf.route_prefix, None))
                         }
                     }
                 }
@@ -440,6 +496,192 @@ impl ThemeSlug {
     }
 }
 
+/// Build a query string for view switching links, preserving sort/order/search.
+fn view_switch_link(
+    target: ViewMode,
+    sort_method: Option<SortingMethod>,
+    sort_order: Option<SortingOrder>,
+    search: Option<&str>,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if target != ViewMode::List {
+        parts.push(format!("view={target}"));
+    }
+    if let (Some(m), Some(o)) = (sort_method, sort_order) {
+        parts.push(format!("sort={m}"));
+        parts.push(format!("order={o}"));
+    }
+    if let Some(s) = search
+        && !s.is_empty()
+    {
+        parts.push(format!("search={}", utf8_percent_encode(s, COMPONENT)));
+    }
+    if parts.is_empty() {
+        "?".to_string()
+    } else {
+        format!("?{}", parts.join("&"))
+    }
+}
+
+/// Partial: view mode switcher (list / grid / album)
+fn view_switcher(
+    current: ViewMode,
+    sort_method: Option<SortingMethod>,
+    sort_order: Option<SortingOrder>,
+    search: Option<&str>,
+) -> Markup {
+    let modes = [
+        (ViewMode::List, "list", "☰", "List view"),
+        (ViewMode::Grid, "grid", "▦", "Grid / thumbnail view"),
+        (ViewMode::Album, "album", "≹", "Album / tiled view"),
+    ];
+    html! {
+        div.view-switcher {
+            @for (mode, slug, icon, title) in modes {
+                @if mode == current {
+                    a.view-btn.active data-view=(slug) title=(title) { (icon) }
+                } @else {
+                    a.view-btn href=(view_switch_link(mode, sort_method, sort_order, search))
+                        data-view=(slug) title=(title) { (icon) }
+                }
+            }
+        }
+    }
+}
+
+/// Partial: grid card for an entry
+#[allow(clippy::too_many_arguments)]
+fn entry_card(
+    entry: Entry,
+    sort_method: Option<SortingMethod>,
+    sort_order: Option<SortingOrder>,
+    search: Option<&str>,
+    show_exact_bytes: bool,
+    actions_conf: Option<ActionsConf>,
+    route_prefix: &str,
+    view: ViewMode,
+) -> Markup {
+    let link = parametrized_link(
+        &entry.link,
+        sort_method,
+        sort_order,
+        false,
+        search,
+        Some(view),
+    );
+    let is_dir = entry.is_dir();
+    html! {
+        div.grid-card.(if is_dir { "dir-card" } else { "file-card" }) {
+            @if is_dir {
+                a.grid-thumb href=(link) {
+                    span.grid-icon { "📁" }
+                }
+                a.grid-name href=(link) {
+                    (entry.name) "/"
+                }
+            } @else if entry.is_image {
+                a.grid-thumb.image-thumb href=(&entry.link) data-lightbox="1" {
+                    img loading="lazy" src=(&entry.link) alt=(&entry.name) {}
+                }
+                div.grid-info {
+                    a.grid-name href=(&entry.link) { (entry.name) }
+                    @if let Some(size) = entry.size {
+                        span.grid-meta {
+                            (if show_exact_bytes {
+                                format!("{} B", size.as_u64())
+                            } else {
+                                format!("{size}")
+                            })
+                        }
+                    }
+                }
+            } @else {
+                a.grid-thumb href=(&entry.link) {
+                    span.grid-icon { "📃" }
+                }
+                div.grid-info {
+                    a.grid-name href=(&entry.link) { (entry.name) }
+                    @if let Some(size) = entry.size {
+                        span.grid-meta {
+                            (if show_exact_bytes {
+                                format!("{} B", size.as_u64())
+                            } else {
+                                format!("{size}")
+                            })
+                        }
+                    }
+                }
+            }
+            @if let Some(conf) = actions_conf {
+                div.grid-actions {
+                    (rm_form(conf.rm_route, &entry.link, route_prefix))
+                }
+            }
+        }
+    }
+}
+
+/// Partial: album tile for an entry (images fill the tile; others fall back to icon tiles)
+#[allow(clippy::too_many_arguments)]
+fn entry_tile(
+    entry: Entry,
+    sort_method: Option<SortingMethod>,
+    sort_order: Option<SortingOrder>,
+    search: Option<&str>,
+    show_exact_bytes: bool,
+    actions_conf: Option<ActionsConf>,
+    route_prefix: &str,
+    view: ViewMode,
+) -> Markup {
+    let link = parametrized_link(
+        &entry.link,
+        sort_method,
+        sort_order,
+        false,
+        search,
+        Some(view),
+    );
+    let is_dir = entry.is_dir();
+    html! {
+        div.album-tile.(if is_dir { "dir-tile" } else { "file-tile" }) {
+            @if is_dir {
+                a.album-bg.icon-bg href=(link) {
+                    span { "📁" }
+                }
+                a.album-name href=(link) { (entry.name) "/" }
+            } @else if entry.is_image {
+                a.album-bg.image-bg href=(&entry.link) data-lightbox="1"
+                    style=(format!("background-image: url('{}');", &entry.link)) {
+                    img.album-preload loading="lazy" src=(&entry.link) alt=(&entry.name) {}
+                }
+                a.album-name href=(&entry.link) {
+                    (entry.name)
+                    @if let Some(size) = entry.size {
+                        " "
+                        span {
+                            (if show_exact_bytes {
+                                format!("{} B", size.as_u64())
+                            } else {
+                                format!("{size}")
+                            })
+                        }
+                    }
+                }
+            } @else {
+                a.album-bg.icon-bg href=(&entry.link) {
+                    span { "📃" }
+                }
+                a.album-name href=(&entry.link) { (entry.name) }
+            }
+            @if let Some(conf) = actions_conf {
+                div.album-actions {
+                    (rm_form(conf.rm_route, &entry.link, route_prefix))
+                }
+            }
+        }
+    }
+}
+
 /// Partial: qr code spoiler
 fn qr_spoiler(show_qrcode: bool, content: &Uri) -> Markup {
     html! {
@@ -463,7 +705,7 @@ fn qr_spoiler(show_qrcode: bool, content: &Uri) -> Markup {
 fn color_scheme_selector(hide_theme_selector: bool) -> Markup {
     html! {
         @if !hide_theme_selector {
-            div {
+            div.theme-picker {
                 p {
                     "Change theme..."
                 }
@@ -501,7 +743,7 @@ fn archive_button(
     } else {
         format!(
             "{}&download={}",
-            parametrized_link("", sort_method, sort_order, false, None),
+            parametrized_link("", sort_method, sort_order, false, None, None),
             archive_method
         )
     };
@@ -531,6 +773,7 @@ fn parametrized_link(
     sort_order: Option<SortingOrder>,
     raw: bool,
     search: Option<&str>,
+    view: Option<ViewMode>,
 ) -> String {
     let mut query: Vec<Cow<'static, str>> = Vec::new();
 
@@ -547,6 +790,13 @@ fn parametrized_link(
         && !search.is_empty()
     {
         query.push(format!("search={}", utf8_percent_encode(search, COMPONENT)).into());
+    }
+
+    // Keep the view mode across navigations (skip the default list view to keep URLs clean)
+    if let Some(view) = view
+        && view != ViewMode::List
+    {
+        query.push(format!("view={view}").into());
     }
 
     if query.is_empty() {
@@ -637,6 +887,7 @@ fn entry_row(
     show_exact_bytes: bool,
     actions_conf: Option<ActionsConf>,
     route_prefix: &str,
+    view: Option<ViewMode>,
 ) -> Markup {
     html! {
         @let entry_type = entry.entry_type.clone();
@@ -645,13 +896,13 @@ fn entry_row(
                 p {
                     @if entry.is_dir() {
                         @if let Some(ref symlink_dest) = entry.symlink_info {
-                            a.symlink href=(parametrized_link(&entry.link, sort_method, sort_order, raw, search)) {
+                            a.symlink href=(parametrized_link(&entry.link, sort_method, sort_order, raw, search, view)) {
                                 (entry.name) "/"
                                 span.symlink-symbol { }
                                 a.directory {(symlink_dest) "/"}
                             }
                         }@else {
-                            a.directory href=(parametrized_link(&entry.link, sort_method, sort_order, raw, search)) {
+                            a.directory href=(parametrized_link(&entry.link, sort_method, sort_order, raw, search, view)) {
                                 (entry.name) "/"
                             }
                         }
@@ -841,6 +1092,270 @@ fn page_header(
                         })
                     }
                     setInterval(updateSizeCells, 1000);
+                "#))
+            }
+
+            script {
+                (PreEscaped(r#"
+                    // ===================================================================
+                    // Image gallery: view memory, lightbox, and lazy tree sidebar
+                    // ===================================================================
+                    // NOTE: this script lives in <head>, so the body isn't parsed yet when
+                    // it runs. We wrap everything in initGallery() and defer until the DOM
+                    // is ready, otherwise getElementById('dir-tree'/'lightbox') return null.
+                    function initGallery() {
+                        // --- View mode memory ---
+                        // Remember the chosen view mode across page loads (the server also
+                        // honors ?view= in the URL, this just keeps things in sync).
+                        function currentViewFromUrl() {
+                            const v = new URLSearchParams(window.location.search).get('view');
+                            return v; // may be null
+                        }
+                        function currentPathRelativeToPrefix() {
+                            const prefix = document.body.dataset.routePrefix || '';
+                            const prefixPath = '/' + prefix;
+                            let p = window.location.pathname;
+                            if (p.startsWith(prefixPath)) {
+                                p = p.substring(prefixPath.length);
+                            } else if (p === prefixPath || p === prefixPath + '/') {
+                                p = '';
+                            }
+                            // Strip leading AND trailing slashes so comparisons against
+                            // data-path (which has no trailing slash) are consistent.
+                            return p.replace(/^\/+/, '').replace(/\/+$/, '');
+                        }
+
+                        // --- Lightbox ---
+                        var lightbox = document.getElementById('lightbox');
+                        var lightboxImg = document.getElementById('lightbox-image');
+                        var lightboxCaption = document.getElementById('lightbox-caption');
+                        var currentImages = [];
+                        var currentIndex = 0;
+
+                        function collectImages() {
+                            currentImages = [];
+                            document.querySelectorAll('[data-lightbox="1"]').forEach(function (el) {
+                                var src = el.getAttribute('href') || (el.querySelector('img') && el.querySelector('img').src);
+                                if (src) {
+                                    var name = el.getAttribute('alt') || el.textContent.trim() ||
+                                               (el.parentElement && el.parentElement.querySelector('.grid-name, .album-name') &&
+                                                el.parentElement.querySelector('.grid-name, .album-name').textContent.trim()) || '';
+                                    currentImages.push({ src: src, name: name });
+                                }
+                            });
+                        }
+
+                        function showImage(index) {
+                            if (currentImages.length === 0) return;
+                            currentIndex = (index + currentImages.length) % currentImages.length;
+                            var item = currentImages[currentIndex];
+                            lightboxImg.src = item.src;
+                            lightboxImg.alt = item.name;
+                            lightboxCaption.textContent = (currentIndex + 1) + ' / ' + currentImages.length + (item.name ? ' — ' + item.name : '');
+                        }
+
+                        function openLightbox(src) {
+                            collectImages();
+                            if (currentImages.length === 0 && src) {
+                                currentImages = [{ src: src, name: '' }];
+                            }
+                            var found = src ? currentImages.findIndex(function (i) { return i.src === src; }) : -1;
+                            showImage(found >= 0 ? found : 0);
+                            lightbox.classList.remove('hidden');
+                            document.body.style.overflow = 'hidden';
+                        }
+
+                        function closeLightbox() {
+                            lightbox.classList.add('hidden');
+                            lightboxImg.src = '';
+                            document.body.style.overflow = '';
+                        }
+
+                        if (lightbox) {
+                            lightbox.querySelector('.lightbox-close').addEventListener('click', closeLightbox);
+                            lightbox.querySelector('.lightbox-prev').addEventListener('click', function (e) { e.stopPropagation(); showImage(currentIndex - 1); });
+                            lightbox.querySelector('.lightbox-next').addEventListener('click', function (e) { e.stopPropagation(); showImage(currentIndex + 1); });
+                            lightbox.addEventListener('click', function (e) { if (e.target === lightbox) closeLightbox(); });
+                            document.addEventListener('keydown', function (e) {
+                                if (lightbox.classList.contains('hidden')) return;
+                                if (e.key === 'Escape') closeLightbox();
+                                else if (e.key === 'ArrowLeft') showImage(currentIndex - 1);
+                                else if (e.key === 'ArrowRight') showImage(currentIndex + 1);
+                            });
+                        }
+
+                        // Intercept clicks on image thumbnails to open the lightbox instead of navigating
+                        document.addEventListener('click', function (e) {
+                            var target = e.target.closest('[data-lightbox="1"]');
+                            if (target) {
+                                e.preventDefault();
+                                openLightbox(target.getAttribute('href'));
+                            }
+                        });
+
+                        // --- Lazy directory tree ---
+                        var tree = document.getElementById('dir-tree');
+                        var currentRelPath = currentPathRelativeToPrefix();
+
+                        function buildNode(name, linkPath, isCurrent) {
+                            var li = document.createElement('li');
+                            li.className = 'tree-node';
+                            li.dataset.path = linkPath;
+                            li.dataset.loaded = 'false';
+
+                            var toggle = document.createElement('span');
+                            toggle.className = 'tree-toggle collapsed';
+                            toggle.textContent = '▸';
+                            toggle.title = 'Expand/collapse';
+
+                            var a = document.createElement('a');
+                            a.className = 'tree-link';
+                            a.textContent = name;
+                            // Build a URL that preserves current query params (sort/order/view/search).
+                            // Construct the path from clean segments to avoid accidental double slashes
+                            // (e.g. "//sub1" would be parsed by the browser as host "sub1").
+                            var params = new URLSearchParams(window.location.search);
+                            params.delete('search');
+                            var qs = params.toString();
+                            // data-route-prefix may carry a leading slash (e.g. "/myroot"); strip it.
+                            var prefix = (document.body.dataset.routePrefix || '').replace(/^\/+/, '');
+                            var segments = ['/'];
+                            if (prefix) segments.push(prefix + '/');
+                            if (linkPath) segments.push(linkPath + '/');
+                            a.href = segments.join('') + (qs ? '?' + qs : '');
+
+                            if (isCurrent) li.classList.add('current');
+
+                            var children = document.createElement('ul');
+                            children.className = 'tree-children';
+                            children.hidden = true;
+
+                            li.appendChild(toggle);
+                            li.appendChild(a);
+                            li.appendChild(children);
+                            return li;
+                        }
+
+                        function fetchChildren(path, ul, onComplete) {
+                            return fetch(API_ROUTE, {
+                                headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
+                                method: 'POST',
+                                body: JSON.stringify({ ListDirs: { path: path } })
+                            }).then(function (r) { return r.ok ? r.json() : { dirs: [] }; })
+                              .then(function (data) {
+                                  var dirs = (data && data.dirs) || [];
+                                  dirs.forEach(function (d) {
+                                      // d.link is relative to serve root, with trailing slash
+                                      var childPath = d.link.replace(/\/+$/, '');
+                                      var node = buildNode(d.name, childPath, false);
+                                      // Highlight the node that is an ancestor of the current path
+                                      if (currentRelPath.startsWith(childPath + '/')) {
+                                          node.classList.add('ancestor');
+                                      }
+                                      ul.appendChild(node);
+                                  });
+                                  if (onComplete) onComplete(dirs.length);
+                              }).catch(function () { if (onComplete) onComplete(0); });
+                        }
+
+                        function toggleNode(node) {
+                            var toggle = node.querySelector(':scope > .tree-toggle');
+                            var children = node.querySelector(':scope > .tree-children');
+                            if (!children) return;
+                            if (node.dataset.loaded === 'false') {
+                                node.classList.add('loading');
+                                fetchChildren(node.dataset.path, children, function () {
+                                    node.dataset.loaded = 'true';
+                                    node.classList.remove('loading');
+                                    children.hidden = false;
+                                    toggle.classList.remove('collapsed');
+                                    toggle.classList.add('expanded');
+                                    toggle.textContent = '▾';
+                                });
+                            } else {
+                                var collapsed = children.hidden;
+                                children.hidden = !collapsed;
+                                if (collapsed) {
+                                    toggle.classList.remove('collapsed');
+                                    toggle.classList.add('expanded');
+                                    toggle.textContent = '▾';
+                                } else {
+                                    toggle.classList.add('collapsed');
+                                    toggle.classList.remove('expanded');
+                                    toggle.textContent = '▸';
+                                }
+                            }
+                        }
+
+                        if (tree) {
+                            tree.addEventListener('click', function (e) {
+                                if (e.target.classList.contains('tree-toggle')) {
+                                    e.preventDefault();
+                                    var node = e.target.closest('.tree-node');
+                                    if (node) toggleNode(node);
+                                }
+                            });
+
+                            // Auto-expand the root, then walk down the current path's ancestors so the
+                            // current directory is visible in the tree on page load.
+                            var rootNode = tree.querySelector('.tree-node.root');
+                            function expandAncestors(prefix) {
+                                var node = tree.querySelector('.tree-node[data-path="' + cssEscape(prefix) + '"]');
+                                if (!node) return;
+                                var children = node.querySelector(':scope > .tree-children');
+                                if (node.dataset.loaded === 'false') {
+                                    node.classList.add('loading');
+                                    fetchChildren(node.dataset.path, children, function (count) {
+                                        node.dataset.loaded = 'true';
+                                        node.classList.remove('loading');
+                                        children.hidden = false;
+                                        var t = node.querySelector(':scope > .tree-toggle');
+                                        t.classList.remove('collapsed'); t.classList.add('expanded'); t.textContent = '▾';
+                                        // find next path segment
+                                        var rest = currentRelPath.substring(prefix.length).replace(/^\/+/, '');
+                                        var next = rest.split('/')[0];
+                                        if (next) {
+                                            expandAncestors(prefix ? prefix + '/' + next : next);
+                                        } else {
+                                            // mark the current node
+                                            var cur = tree.querySelector('.tree-node[data-path="' + cssEscape(currentRelPath) + '"]');
+                                            if (cur) cur.classList.add('current');
+                                        }
+                                    });
+                                }
+                            }
+
+                            // Minimal CSS.escape polyfill-ish for our needs
+                            function cssEscape(s) {
+                                return (window.CSS && CSS.escape) ? CSS.escape(s) : s.replace(/["\\]/g, '\\$&');
+                            }
+
+                            if (rootNode) {
+                                // expand root first
+                                var rootChildren = rootNode.querySelector(':scope > .tree-children');
+                                rootNode.classList.add('loading');
+                                fetchChildren('', rootChildren, function () {
+                                    rootNode.dataset.loaded = 'true';
+                                    rootNode.classList.remove('loading');
+                                    rootChildren.hidden = false;
+                                    var t = rootNode.querySelector(':scope > .tree-toggle');
+                                    t.classList.remove('collapsed'); t.classList.add('expanded'); t.textContent = '▾';
+                                    if (currentRelPath) {
+                                        var first = currentRelPath.split('/')[0];
+                                        if (first) expandAncestors(first);
+                                    }
+                                });
+                            }
+                        }
+                    }
+
+                    // Run the gallery logic once the DOM is fully parsed. Since this script
+                    // is in <head>, the body may not exist yet at parse time.
+                    if (document.readyState === 'loading') {
+                        document.addEventListener('DOMContentLoaded', initGallery);
+                    } else {
+                        initGallery();
+                    }
                 "#))
             }
 

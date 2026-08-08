@@ -6,7 +6,7 @@ use actix_web::http::header::{HeaderMap, HeaderName, HeaderValue};
 use clap::{Parser, ValueEnum, ValueHint};
 
 use crate::auth;
-use crate::listing::{SortingMethod, SortingOrder};
+use crate::listing::{SortingMethod, SortingOrder, ViewMode};
 use crate::renderer::ThemeSlug;
 
 #[derive(ValueEnum, Clone)]
@@ -187,6 +187,15 @@ pub struct CliArgs {
         env = "MINISERVE_DEFAULT_SORTING_ORDER"
     )]
     pub default_sorting_order: SortingOrder,
+
+    /// Default view mode for file list (list, grid, or album)
+    #[arg(
+        long = "default-view",
+        default_value = "list",
+        ignore_case = true,
+        env = "MINISERVE_DEFAULT_VIEW"
+    )]
+    pub default_view: ViewMode,
 
     /// Default color scheme
     #[arg(

@@ -65,6 +65,9 @@ pub struct MiniserveConfig {
     /// Default sorting order
     pub default_sorting_order: SortingOrder,
 
+    /// Default view mode (list, grid, album)
+    pub default_view: crate::listing::ViewMode,
+
     /// Route prefix; Either empty or prefixed with slash
     pub route_prefix: String,
 
@@ -340,6 +343,7 @@ impl MiniserveConfig {
             show_hidden: args.hidden,
             default_sorting_method: args.default_sorting_method,
             default_sorting_order: args.default_sorting_order,
+            default_view: args.default_view,
             route_prefix,
             healthcheck_route,
             api_route,

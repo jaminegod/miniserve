@@ -281,12 +281,26 @@ nav {
   justify-content: flex-end;
 }
 
+nav {
+  padding: 0 5rem;
+  display: flex;
+  justify-content: flex-end;
+}
+
 nav>div {
   position: relative;
   margin-left: 0.5rem;
 }
 
-nav p {
+// Theme picker dropdown (lives inside .search-box next to the view switcher)
+.theme-picker {
+  position: relative;
+  margin-left: 0.5rem;
+  // Ensure the dropdown floats above the workspace content that follows in DOM order
+  z-index: 100;
+}
+
+.theme-picker p {
   padding: 0.5rem 1rem;
   width: 8rem;
   text-align: center;
@@ -294,7 +308,7 @@ nav p {
   color: var(--change_theme_link_color);
 }
 
-nav p+* {
+.theme-picker p+* {
   display: none;
   position: absolute;
   left: 0;
@@ -312,12 +326,12 @@ nav p+* {
   }
 }
 
-nav>div:hover p {
+.theme-picker:hover p {
   cursor: pointer;
   color: var(--switch_theme_link_color);
 }
 
-nav>div:hover p+* {
+.theme-picker:hover p+* {
   display: block;
   border-top: 1px solid var(--switch_theme_border);
 }
@@ -331,18 +345,18 @@ nav .qrcode svg {
   display: block;
 }
 
-nav .theme {
+.theme-picker .theme {
   margin: 0;
   padding: 0;
   list-style-type: none;
 }
 
-nav .theme li {
+.theme-picker .theme li {
   width: 100%;
   background: var(--switch_theme_background);
 }
 
-nav .theme li a {
+.theme-picker .theme li a {
   display: block;
   width: 100%;
   padding: 0.5rem 0;
@@ -350,11 +364,11 @@ nav .theme li a {
   color: var(--switch_theme_link_color);
 }
 
-nav .theme li a:visited {
+.theme-picker .theme li a:visited {
   color: var(--switch_theme_link_color);
 }
 
-nav .theme li a:hover {
+.theme-picker .theme li a:hover {
   text-decoration: underline;
   color: var(--change_theme_link_color_hover);
 }
@@ -370,7 +384,9 @@ h1 {
 }
 
 table {
-  margin-top: 2rem;
+  // Keep the list view top-aligned with the grid/album views and the tree sidebar.
+  // (Previously margin-top: 2rem pushed the table below the sidebar's top.)
+  margin-top: 0;
   width: 100%;
   border: 0;
   table-layout: auto;
@@ -748,12 +764,25 @@ th span.active span {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+// Breadcrumb title: cap at ~half the width and ellipsize instead of wrapping,
+// so the search box + view switcher stay on the same line.
+.title-search-box > .title {
+  min-width: 0;
+  max-width: 50%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  display: inline-block;
 }
 
 .search-box {
   display: flex;
   align-items: center;
+  gap: 0.5rem;
+  flex-shrink: 0;
 }
 
 .search-box form {
@@ -777,9 +806,397 @@ th span.active span {
   min-width: max-content;
 }
 
+// =============================================================================
+// Image gallery / explorer-style view additions
+// =============================================================================
+
+// ---- Workspace layout: tree sidebar + content area ----
+.workspace {
+  display: flex;
+  gap: 1rem;
+  align-items: flex-start;
+}
+
+.tree-sidebar {
+  flex: 0 0 240px;
+  max-height: calc(100vh - 6rem);
+  overflow-y: auto;
+  overflow-x: hidden;
+  background: var(--switch_theme_background);
+  border: 1px solid var(--switch_theme_border);
+  border-radius: 0.4rem;
+  padding: 0.5rem;
+  font-size: 0.9em;
+  position: sticky;
+  top: 0.5rem;
+}
+
+.content-area {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.tree-header {
+  font-weight: bold;
+  padding: 0.25rem 0.5rem;
+  margin-bottom: 0.25rem;
+  border-bottom: 1px solid var(--switch_theme_border);
+  color: var(--change_theme_link_color);
+}
+
+ul.tree {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+ul.tree ul.tree-children {
+  list-style: none;
+  margin: 0;
+  padding-left: 1rem;
+}
+
+li.tree-node {
+  margin: 0.1rem 0;
+}
+
+.tree-node {
+  display: block;
+}
+
+.tree-toggle {
+  display: inline-block;
+  width: 1.1rem;
+  cursor: pointer;
+  text-align: center;
+  user-select: none;
+  color: var(--change_theme_link_color);
+  opacity: 0.7;
+}
+
+.tree-toggle.collapsed {
+  transform: rotate(0deg);
+}
+
+.tree-toggle.expanded {
+  transform: rotate(90deg);
+}
+
+a.tree-link {
+  color: var(--directory_link_color);
+  text-decoration: none;
+}
+
+a.tree-link:hover {
+  text-decoration: underline;
+}
+
+li.tree-node.current > a.tree-link {
+  font-weight: bold;
+  background: rgba(128, 128, 128, 0.15);
+  border-radius: 0.2rem;
+}
+
+li.tree-node.loading > .tree-toggle::after {
+  content: " ⏳";
+}
+
+// ---- View mode switcher ----
+.view-switcher {
+  display: flex;
+  gap: 0.25rem;
+  padding: 0.25rem;
+  background: var(--switch_theme_background);
+  border: 1px solid var(--switch_theme_border);
+  border-radius: 0.4rem;
+  width: max-content;
+}
+
+a.view-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2.2rem;
+  height: 2.2rem;
+  text-decoration: none;
+  color: var(--change_theme_link_color);
+  border-radius: 0.3rem;
+  font-size: 1.2em;
+  cursor: pointer;
+}
+
+a.view-btn:hover {
+  background: rgba(128, 128, 128, 0.2);
+}
+
+a.view-btn.active {
+  background: var(--switch_theme_border);
+  font-weight: bold;
+}
+
+// ---- Grid view ----
+.grid-view {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 1rem;
+  padding: 0.5rem 0;
+}
+
+.grid-card {
+  border: 1px solid var(--switch_theme_border);
+  border-radius: 0.4rem;
+  background: var(--switch_theme_background);
+  overflow: hidden;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+
+.grid-card:hover {
+  border-color: var(--directory_link_color);
+}
+
+.grid-thumb {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  background: rgba(128, 128, 128, 0.12);
+  text-decoration: none;
+  overflow: hidden;
+}
+
+.grid-icon {
+  font-size: 2.5em;
+}
+
+.grid-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  opacity: 0;
+  transition: opacity 0.3s ease;
+}
+
+.grid-thumb img[src] {
+  opacity: 1;
+}
+
+.grid-info {
+  padding: 0.4rem 0.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.grid-name {
+  color: var(--file_link_color);
+  text-decoration: none;
+  font-size: 0.85em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dir-card .grid-name {
+  color: var(--directory_link_color);
+  font-weight: bold;
+}
+
+.grid-name:hover {
+  text-decoration: underline;
+}
+
+.grid-meta {
+  font-size: 0.75em;
+  opacity: 0.7;
+}
+
+.grid-actions,
+.album-actions {
+  position: absolute;
+  top: 0.25rem;
+  right: 0.25rem;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.grid-card:hover .grid-actions,
+.album-tile:hover .album-actions {
+  opacity: 1;
+}
+
+.parent-card {
+  border-style: dashed;
+}
+
+// ---- Album view ----
+.album-view {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 0.5rem;
+  padding: 0.5rem 0;
+}
+
+.album-tile {
+  position: relative;
+  aspect-ratio: 1 / 1;
+  border-radius: 0.4rem;
+  overflow: hidden;
+  border: 1px solid var(--switch_theme_border);
+  background: rgba(128, 128, 128, 0.12);
+}
+
+.album-tile:hover {
+  border-color: var(--directory_link_color);
+}
+
+.album-bg {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-decoration: none;
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+}
+
+.album-bg.icon-bg span {
+  font-size: 2.5em;
+}
+
+.album-preload {
+  display: none;
+}
+
+.album-name {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 0.4rem 0.5rem;
+  background: linear-gradient(transparent, rgba(0, 0, 0, 0.75));
+  color: #fff;
+  text-decoration: none;
+  font-size: 0.8em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.album-tile:hover .album-name {
+  background: linear-gradient(transparent, rgba(0, 0, 0, 0.9));
+}
+
+.parent-tile {
+  border-style: dashed;
+}
+
+// ---- Lightbox modal ----
+.lightbox-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  background: rgba(0, 0, 0, 0.92);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.lightbox-modal.hidden {
+  display: none;
+}
+
+img.lightbox-image {
+  max-width: 90vw;
+  max-height: 85vh;
+  object-fit: contain;
+  display: block;
+}
+
+.lightbox-caption {
+  position: absolute;
+  bottom: 1rem;
+  left: 0;
+  right: 0;
+  text-align: center;
+  color: #fff;
+  font-size: 0.9em;
+  padding: 0 1rem;
+}
+
+.lightbox-close,
+.lightbox-prev,
+.lightbox-next {
+  position: absolute;
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+  border: none;
+  cursor: pointer;
+  font-size: 2em;
+  width: 3rem;
+  height: 3rem;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+}
+
+.lightbox-close:hover,
+.lightbox-prev:hover,
+.lightbox-next:hover {
+  background: rgba(255, 255, 255, 0.25);
+}
+
+.lightbox-close {
+  top: 1rem;
+  right: 1rem;
+}
+
+.lightbox-prev {
+  left: 1rem;
+  top: 50%;
+  transform: translateY(-50%);
+}
+
+.lightbox-next {
+  right: 1rem;
+  top: 50%;
+  transform: translateY(-50%);
+}
+
 @media (max-width: 760px) {
   nav {
     padding: 0 2.5rem;
+  }
+
+  // On mobile, stack the workspace vertically and hide the tree sidebar to save space
+  .workspace {
+    flex-direction: column;
+  }
+
+  .tree-sidebar {
+    display: none;
+  }
+
+  .grid-view {
+    grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+    gap: 0.5rem;
+  }
+
+  .album-view {
+    grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+    gap: 0.4rem;
+  }
+
+  .grid-icon,
+  .album-bg.icon-bg span {
+    font-size: 1.8em;
   }
 
   .container {
@@ -923,7 +1340,7 @@ th span.active span {
 
 // when no specific theme is applied, highlight the `default` theme button in
 // the theme menu
-body:not([data-theme]) nav .theme li[data-theme="default"] a {
+body:not([data-theme]) .theme-picker .theme li[data-theme="default"] a {
   @extend %active_theme_link;
 }
 
@@ -932,7 +1349,7 @@ body:not([data-theme]) nav .theme li[data-theme="default"] a {
     @include theme($theme);
 
     // highlight the currently active theme in the theme selection menu
-    nav .theme li[data-theme="#{$theme}"] a {
+    .theme-picker .theme li[data-theme="#{$theme}"] a {
       @extend %active_theme_link;
     }
   }

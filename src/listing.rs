@@ -47,7 +47,39 @@ pub struct ListingQueryParameters {
     pub order: Option<SortingOrder>,
     pub raw: Option<bool>,
     pub search: Option<String>,
+    pub view: Option<ViewMode>,
     download: Option<ArchiveMethod>,
+}
+
+/// Available view modes for the file listing
+#[derive(
+    Debug, Deserialize, Default, Clone, Copy, EnumString, Display, PartialEq, Eq, ValueEnum,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum ViewMode {
+    /// Classic table list view (default)
+    #[default]
+    List,
+
+    /// Grid / thumbnail view
+    Grid,
+
+    /// Album / tiled view (images only, names overlaid)
+    Album,
+}
+
+/// Image file extensions recognized by miniserve (lowercase, no leading dot).
+const IMAGE_EXTENSIONS: &[&str] = &[
+    "jpg", "jpeg", "png", "gif", "webp", "svg", "bmp", "avif", "ico",
+];
+
+/// Returns whether a file name has an image extension.
+pub fn is_image_by_extension(name: &str) -> bool {
+    match name.rsplit('.').next() {
+        Some(ext) => IMAGE_EXTENSIONS.contains(&ext.to_lowercase().as_str()),
+        None => false,
+    }
 }
 
 /// Available sorting methods
@@ -111,6 +143,9 @@ pub struct Entry {
 
     /// Path of symlink pointed to
     pub symlink_info: Option<String>,
+
+    /// Whether the entry is an image file (determined by extension)
+    pub is_image: bool,
 }
 
 impl Entry {
@@ -122,6 +157,7 @@ impl Entry {
         last_modification_date: Option<SystemTime>,
         symlink_info: Option<String>,
     ) -> Self {
+        let is_image = entry_type == EntryType::File && is_image_by_extension(&name);
         Self {
             name,
             entry_type,
@@ -129,6 +165,7 @@ impl Entry {
             size,
             last_modification_date,
             symlink_info,
+            is_image,
         }
     }
 
@@ -470,5 +507,82 @@ pub fn extract_query_parameters(req: &HttpRequest) -> ListingQueryParameters {
             errors::log_error_chain(err.to_string());
             ListingQueryParameters::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_image_by_extension_common_formats() {
+        for ext in &[
+            "photo.jpg",
+            "photo.jpeg",
+            "photo.JPG",
+            "photo.PNG",
+            "icon.gif",
+            "modern.webp",
+            "vector.svg",
+            "old.bmp",
+            "avif.img.avif",
+            "favicon.ico",
+        ] {
+            assert!(is_image_by_extension(ext), "{ext} should be an image");
+        }
+    }
+
+    #[test]
+    fn test_is_image_by_extension_non_images() {
+        for name in &[
+            "readme.md",
+            "archive.zip",
+            "movie.mp4",
+            "song.mp3",
+            "noext",
+            "data.json",
+            "image.txt",
+        ] {
+            assert!(
+                !is_image_by_extension(name),
+                "{name} should NOT be an image"
+            );
+        }
+    }
+
+    #[test]
+    fn test_entry_is_image_flag() {
+        // A file with an image extension is flagged as an image
+        let img = Entry::new(
+            "x.png".into(),
+            EntryType::File,
+            "/x.png".into(),
+            None,
+            None,
+            None,
+        );
+        assert!(img.is_image);
+
+        // A directory is never an image, even with an image-like name
+        let dir = Entry::new(
+            "folder.png".into(),
+            EntryType::Directory,
+            "/folder.png/".into(),
+            None,
+            None,
+            None,
+        );
+        assert!(!dir.is_image);
+
+        // A non-image file
+        let txt = Entry::new(
+            "notes.txt".into(),
+            EntryType::File,
+            "/notes.txt".into(),
+            None,
+            None,
+            None,
+        );
+        assert!(!txt.is_image);
     }
 }
