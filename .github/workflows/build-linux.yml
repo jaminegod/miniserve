@@ -1,0 +1,121 @@
+name: Build Linux release
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+    branches: ["main", "master"]
+  workflow_dispatch: {}
+
+env:
+  RUST_TOOLCHAIN: stable
+
+jobs:
+  build:
+    name: Build on Ubuntu (Linux)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Cache cargo registry, git and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          profile: minimal
+          components: clippy
+
+      - name: Show rust & cargo versions
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Build (release)
+        run: cargo build --release --locked
+
+      - name: List built artifacts
+        run: ls -lah target/release || true
+
+      - name: Strip binaries (reduce size)
+        run: |
+          set -e
+          for f in target/release/* ; do
+            if [ -f "$f" ] && [ -x "$f" ]; then
+              echo "Stripping $f"
+              strip "$f" || true
+            fi
+          done
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: miniserve-linux-release
+          path: target/release/*
+
+  build-static-musl:
+    name: Build static (musl) for x86_64 (optional)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build deps (musl)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools pkg-config
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-musl-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-musl-
+
+      - name: Install Rust toolchain and add musl target
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          profile: minimal
+
+      - name: Add musl target
+        run: rustup target add x86_64-unknown-linux-musl
+
+      - name: Build static binary (musl)
+        env:
+          CC: musl-gcc
+        run: cargo build --release --target x86_64-unknown-linux-musl --locked
+
+      - name: List musl build outputs
+        run: ls -lah target/x86_64-unknown-linux-musl/release || true
+
+      - name: Strip musl binaries
+        run: |
+          set -e
+          for f in target/x86_64-unknown-linux-musl/release/* ; do
+            if [ -f "$f" ] && [ -x "$f" ]; then
+              echo "Stripping $f"
+              x86_64-linux-gnu-strip "$f" 2>/dev/null || strip "$f" || true
+            fi
+          done
+
+      - name: Upload musl artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: miniserve-linux-musl
+          path: target/x86_64-unknown-linux-musl/release/*
