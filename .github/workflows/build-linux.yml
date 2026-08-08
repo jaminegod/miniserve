@@ -1,3 +1,5 @@
+# Build Linux release (Ubuntu / generic Linux)
+# Saves only final binaries (not the whole target dir) and applies size optimizations.
 name: Build Linux release
 
 on:
@@ -42,31 +44,46 @@ jobs:
           rustc --version
           cargo --version
 
-      - name: Build (release)
+      - name: Build (release) with size optimizations
+        env:
+          # Temporary per-run optimizations (don't require changing Cargo.toml)
+          RUSTFLAGS: -C lto=yes -C opt-level=z -C codegen-units=1
         run: cargo build --release --locked
 
-      - name: List built artifacts
-        run: ls -lah target/release || true
-
-      - name: Strip binaries (reduce size)
+      - name: Copy final executables to artifact dir and strip
         run: |
           set -e
-          for f in target/release/* ; do
-            if [ -f "$f" ] && [ -x "$f" ]; then
+          mkdir -p release_artifacts
+          echo "Finding top-level executables in target/release (no deps/ subdirs)..."
+          # Copy only top-level executable files (avoid copying deps, *.rlib, debug files)
+          find target/release -maxdepth 1 -type f -executable -print0 | while IFS= read -r -d '' bin; do
+            echo "Copying $bin"
+            cp "$bin" release_artifacts/ || true
+          done
+          # On some runners binaries are not marked executable; also copy by common names (optional)
+          # Strip the copied binaries to reduce size
+          for f in release_artifacts/* ; do
+            if [ -f "$f" ]; then
+              echo "File: $f"
+              file "$f" || true
               echo "Stripping $f"
               strip "$f" || true
             fi
           done
+          echo "Artifact dir size:"
+          du -sh release_artifacts || true
+          ls -lah release_artifacts || true
 
       - name: Upload release artifacts
         uses: actions/upload-artifact@v4
         with:
           name: miniserve-linux-release
-          path: target/release/*
+          path: release_artifacts/*
 
   build-static-musl:
     name: Build static (musl) for x86_64 (optional)
     runs-on: ubuntu-latest
+    # If you don't need musl static builds you can remove this job.
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -74,7 +91,7 @@ jobs:
       - name: Install build deps (musl)
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools pkg-config
+          sudo apt-get install -y musl-tools pkg-config build-essential
 
       - name: Cache cargo registry and target
         uses: actions/cache@v4
@@ -96,26 +113,43 @@ jobs:
       - name: Add musl target
         run: rustup target add x86_64-unknown-linux-musl
 
-      - name: Build static binary (musl)
+      - name: Build static binary (musl) with optimizations
         env:
+          RUSTFLAGS: -C lto=yes -C opt-level=z -C codegen-units=1
           CC: musl-gcc
         run: cargo build --release --target x86_64-unknown-linux-musl --locked
 
-      - name: List musl build outputs
-        run: ls -lah target/x86_64-unknown-linux-musl/release || true
-
-      - name: Strip musl binaries
+      - name: Copy musl binary(s) to artifact dir and strip
         run: |
           set -e
-          for f in target/x86_64-unknown-linux-musl/release/* ; do
-            if [ -f "$f" ] && [ -x "$f" ]; then
+          mkdir -p release_artifacts_musl
+          echo "Finding top-level executables in target/x86_64-unknown-linux-musl/release..."
+          find target/x86_64-unknown-linux-musl/release -maxdepth 1 -type f -executable -print0 | while IFS= read -r -d '' bin; do
+            echo "Copying $bin"
+            cp "$bin" release_artifacts_musl/ || true
+          done
+          # Some musl builds might not mark as executable; include regular files with no extension
+          find target/x86_64-unknown-linux-musl/release -maxdepth 1 -type f ! -name '*.d' -print0 | while IFS= read -r -d '' bin; do
+            bn=$(basename "$bin")
+            # copy if not already copied
+            if [ ! -f "release_artifacts_musl/$bn" ]; then
+              cp "$bin" release_artifacts_musl/ || true
+            fi
+          done
+          for f in release_artifacts_musl/* ; do
+            if [ -f "$f" ]; then
+              echo "File: $f"
+              file "$f" || true
               echo "Stripping $f"
               x86_64-linux-gnu-strip "$f" 2>/dev/null || strip "$f" || true
             fi
           done
+          echo "Musl artifact dir size:"
+          du -sh release_artifacts_musl || true
+          ls -lah release_artifacts_musl || true
 
       - name: Upload musl artifacts
         uses: actions/upload-artifact@v4
         with:
           name: miniserve-linux-musl
-          path: target/x86_64-unknown-linux-musl/release/*
+          path: release_artifacts_musl/*
