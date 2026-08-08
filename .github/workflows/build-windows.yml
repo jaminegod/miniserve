@@ -1,6 +1,5 @@
-name: Build Windows release
+name: Build Windows release (native MSVC)
 
-# Triggers: push to main/master, PR, or manual run
 on:
   # push:
   #   branches: ["main", "master"]
@@ -13,7 +12,7 @@ env:
 
 jobs:
   build-msvc:
-    name: Build (MSVC) on windows-latest
+    name: Build (MSVC) on windows-latest (native .exe)
     runs-on: windows-latest
 
     steps:
@@ -46,20 +45,22 @@ jobs:
           profile: minimal
           components: clippy
 
-      - name: Build (release) with safe size optimizations (MSVC)
+      - name: Build (release) with safe size-friendly flags (MSVC)
         run: |
           # Remove any embedded-bitcode flag that may be present in RUSTFLAGS
           $env:RUSTFLAGS = ($env:RUSTFLAGS -replace '-C embed-bitcode=no','').Trim()
           # Add size-friendly flags but avoid -C lto to prevent embed-bitcode conflicts
           $env:RUSTFLAGS = ($env:RUSTFLAGS + ' -C opt-level=z -C codegen-units=1').Trim()
           Write-Host "Effective RUSTFLAGS: <$env:RUSTFLAGS>"
+          # Build release (native MSVC). This produces .exe and optional .pdb files.
           cargo build --release --locked
         shell: pwsh
 
-      - name: Copy final executables to artifact dir (MSVC) and tidy
+      - name: Collect .exe, remove PDBs, optionally compress with UPX
         run: |
           # Prepare artifact dir
-          if (-Not (Test-Path release_artifacts)) { New-Item -ItemType Directory -Path release_artifacts | Out-Null }
+          if (Test-Path release_artifacts) { Remove-Item -Recurse -Force release_artifacts -ErrorAction SilentlyContinue }
+          New-Item -ItemType Directory -Path release_artifacts | Out-Null
 
           # Copy top-level .exe files from target\release (avoid deps/pdb etc.)
           Get-ChildItem -Path target\release -File -ErrorAction SilentlyContinue | ForEach-Object {
@@ -69,117 +70,62 @@ jobs:
             }
           }
 
-          # Remove any PDBs (debug symbols) from artifact dir to keep size small
+          # If crate binary uses non-standard name, attempt to copy by common names
+          if (-Not (Get-ChildItem -Path release_artifacts -Filter *.exe -File -ErrorAction SilentlyContinue)) {
+            Write-Host "No .exe found in release_artifacts; attempting fallback copy"
+            if (Test-Path target\release\miniserve.exe) {
+              Copy-Item -Path target\release\miniserve.exe -Destination release_artifacts -Force
+            } elseif (Test-Path target\release\miniserve) {
+              Copy-Item -Path target\release\miniserve -Destination release_artifacts -Force
+            }
+          }
+
+          # Remove PDB files to reduce upload size (keep them out of artifact)
           Get-ChildItem -Path release_artifacts -Filter *.pdb -File -Recurse -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
 
-          Write-Host "Artifact files:"
+          # OPTIONAL: compress executables with UPX (comment out if not desired)
+          # UPX can reduce size but may trigger AV false positives.
+          # Uncomment the block below to enable UPX (attempts to install via choco).
+          # if (-Not (Get-Command upx -ErrorAction SilentlyContinue)) {
+          #   Write-Host "Installing upx (optional)..."
+          #   choco install upx.portable -y || Write-Host "choco install upx failed or not available"
+          # }
+          # if (Get-Command upx -ErrorAction SilentlyContinue) {
+          #   Get-ChildItem -Path release_artifacts -Filter *.exe -File | ForEach-Object {
+          #     Write-Host "UPX compressing $($_.FullName)"
+          #     upx --best --lzma $_.FullName || Write-Host "UPX failed for $($_.FullName)"
+          #   }
+          # } else {
+          #   Write-Host "UPX not available; skipping compression"
+          # }
+
+          Write-Host "Artifact files (pre-zip):"
           Get-ChildItem -Path release_artifacts | Select-Object Name, @{Name='KB';Expression={[math]::Round($_.Length/1KB,2)}}
         shell: pwsh
 
-      - name: (Optional) Zip Windows MSVC artifacts
+      - name: Create zip from artifact dir (zip will contain files, not the outer folder)
         run: |
-          if (-Not (Test-Path release_artifacts)) { Write-Host 'No artifacts to zip'; exit 0 }
-          $zip = 'miniserve-windows-msvc.zip'
-          if (Test-Path $zip) { Remove-Item $zip -Force }
-          Compress-Archive -Path release_artifacts\* -DestinationPath $zip -Force
-          Write-Host "Zip created: $zip"
+          if (-Not (Test-Path release_artifacts)) {
+            Write-Host "No artifacts to zip"; exit 0
+          }
+          if (Test-Path miniserve-windows-msvc.zip) { Remove-Item miniserve-windows-msvc.zip -Force -ErrorAction SilentlyContinue }
+          # Compress-Archive with release_artifacts\* will include files without adding outer folder
+          Compress-Archive -Path release_artifacts\* -DestinationPath miniserve-windows-msvc.zip -Force
+          Write-Host "Created zip: miniserve-windows-msvc.zip"
+          Get-Item miniserve-windows-msvc.zip | Select-Object Name, @{Name='KB';Expression={[math]::Round($_.Length/1KB,2)}}
         shell: pwsh
 
-      - name: Upload release artifacts (MSVC)
+      - name: Sanity: list zip entries (optional, best-effort)
+        run: |
+          if (Test-Path miniserve-windows-msvc.zip) {
+            Write-Host "Zip size:"; Get-Item miniserve-windows-msvc.zip | Select-Object Name, @{Name='KB';Expression={[math]::Round($_.Length/1KB,2)}}
+          } else {
+            Write-Host "No zip found"
+          }
+        shell: pwsh
+
+      - name: Upload release artifact (zip only)
         uses: actions/upload-artifact@v4
         with:
           name: miniserve-windows-msvc
-          path: |
-            release_artifacts/*
-            miniserve-windows-msvc.zip
-
-  cross-build-gnu:
-    name: Cross-build (x86_64-pc-windows-gnu) on Ubuntu (optional)
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Show environment (cross debug)
-        run: |
-          echo "Runner: $RUNNER_OS"
-          echo "Initial RUSTFLAGS: <$RUSTFLAGS>"
-          rustc --version || true
-          cargo --version || true
-
-      - name: Install mingw cross toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y mingw-w64 pkg-config build-essential
-
-      - name: Cache cargo registry, git and target
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-windows-gnu-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-windows-gnu-
-
-      - name: Install Rust toolchain and add windows targets
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-          profile: minimal
-
-      - name: Add windows GNU target
-        run: rustup target add x86_64-pc-windows-gnu
-
-      - name: Build x86_64-pc-windows-gnu (release) with safe optimizations
-        run: |
-          # Clean conflicting embed-bitcode if present
-          export RUSTFLAGS="${RUSTFLAGS//-C embed-bitcode=no/}"
-          export RUSTFLAGS="$RUSTFLAGS -C opt-level=z -C codegen-units=1"
-          echo "Effective RUSTFLAGS: <$RUSTFLAGS>"
-          export CC_x86_64_pc_windows_gnu=x86_64-w64-mingw32-gcc
-          cargo build --release --target x86_64-pc-windows-gnu --locked
-
-      - name: Copy windows-gnu executables to artifact dir and strip
-        run: |
-          set -e
-          mkdir -p release_artifacts_windows_gnu
-          echo "Finding final binaries in target/x86_64-pc-windows-gnu/release..."
-          find target/x86_64-pc-windows-gnu/release -maxdepth 1 -type f -print0 | while IFS= read -r -d '' bin; do
-            bn=$(basename "$bin")
-            # copy exe files or files without extension (heuristic)
-            if [[ "$bn" == *.exe ]] || [[ "$bn" != *.* ]]; then
-              echo "Copying $bin"
-              cp "$bin" release_artifacts_windows_gnu/ || true
-            fi
-          done
-          # Fallback by crate name
-          if [ -f target/x86_64-pc-windows-gnu/release/miniserve.exe ] && [ ! -f release_artifacts_windows_gnu/miniserve.exe ]; then
-            cp target/x86_64-pc-windows-gnu/release/miniserve.exe release_artifacts_windows_gnu/ || true
-          fi
-          # Strip the mingw-built exes to reduce size
-          for f in release_artifacts_windows_gnu/* ; do
-            if [ -f "$f" ]; then
-              echo "Stripping $f"
-              x86_64-w64-mingw32-strip "$f" || true
-            fi
-          done
-          echo "Artifact dir size:"
-          du -sh release_artifacts_windows_gnu || true
-          ls -lah release_artifacts_windows_gnu || true
-
-      - name: Zip windows-gnu artifacts
-        run: |
-          if [ -d release_artifacts_windows_gnu ]; then
-            zip -r miniserve-windows-gnu.zip release_artifacts_windows_gnu || true
-          fi
-
-      - name: Upload release artifacts (windows-gnu)
-        uses: actions/upload-artifact@v4
-        with:
-          name: miniserve-windows-gnu
-          path: |
-            release_artifacts_windows_gnu/*
-            miniserve-windows-gnu.zip
+          path: miniserve-windows-msvc.zip
