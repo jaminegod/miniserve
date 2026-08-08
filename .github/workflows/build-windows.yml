@@ -2,10 +2,10 @@ name: Build Windows release
 
 # Triggers: push to main/master, PR, or manual run
 on:
-  push:
-    branches: ["main", "master"]
-  pull_request:
-    branches: ["main", "master"]
+  # push:
+  #   branches: ["main", "master"]
+  # pull_request:
+  #   branches: ["main", "master"]
   workflow_dispatch: {}
 
 env:
